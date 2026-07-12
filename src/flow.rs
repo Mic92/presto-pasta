@@ -74,6 +74,9 @@ pub struct Tcp {
     pub sndbuf: u32,
     pub host_fin: FinState,
     pub guest_fin_received: bool,
+    /// An ack owed to the guest was withheld for one in-order data
+    /// frame; the next data frame acks unconditionally.
+    pub ack_deferred: bool,
     /// A poll for readability of the host socket is pending.
     pub poll_armed: bool,
 }

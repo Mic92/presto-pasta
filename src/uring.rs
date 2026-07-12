@@ -593,6 +593,7 @@ impl EventLoop {
                 sndbuf,
                 host_fin: flow::FinState::NotSent,
                 guest_fin_received: false,
+                ack_deferred: false,
                 poll_armed: false,
             }),
             closing: false,
@@ -709,7 +710,6 @@ impl EventLoop {
         let expected_seq = self.tcp_state(id).map(|t| t.seq_from_guest);
         let mut accepted = 0;
         if !payload.is_empty() {
-            ack_guest = true;
             if Some(hdr.seq) == expected_seq {
                 let data = &self.pool.get(self.tap_buf)[payload.clone()];
                 accepted =
@@ -719,6 +719,17 @@ impl EventLoop {
                     {
                         t.seq_from_guest = t.seq_from_guest.wrapping_add(accepted as u32);
                     }
+                }
+            }
+            // Dropped or partially accepted data needs an immediate
+            // (duplicate) ack so the guest retransmits; in-order frames
+            // without PSH are acked only every second frame to halve
+            // tap writes on bulk uploads.
+            if let Some(t) = self.flows.get_mut(id).and_then(|f| f.tcp.as_mut()) {
+                if accepted == payload.len() && hdr.flags & proto::TCP_PSH == 0 && !t.ack_deferred {
+                    t.ack_deferred = true;
+                } else {
+                    ack_guest = true;
                 }
             }
         }
@@ -737,6 +748,9 @@ impl EventLoop {
             ack_guest = true;
         }
         if ack_guest {
+            if let Some(t) = self.flows.get_mut(id).and_then(|f| f.tcp.as_mut()) {
+                t.ack_deferred = false;
+            }
             self.send_tcp_control(id, proto::TCP_ACK);
         }
         // Acks or window updates may allow more data towards the guest.

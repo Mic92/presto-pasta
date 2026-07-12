@@ -19,6 +19,7 @@ pub const TCP_HDR_LEN: usize = 20;
 pub const TCP_FIN: u8 = 0x01;
 pub const TCP_SYN: u8 = 0x02;
 pub const TCP_RST: u8 = 0x04;
+pub const TCP_PSH: u8 = 0x08;
 pub const TCP_ACK: u8 = 0x10;
 
 pub const ICMP_HDR_LEN: usize = 8;
