@@ -32,7 +32,7 @@
       packages = forAllSystems (pkgs: {
         default = pkgs.rustPlatform.buildRustPackage {
           pname = "presto-pasta";
-          version = "0.0.2";
+          version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
           src = self;
           cargoLock.lockFile = ./Cargo.lock;
           # The netns integration tests need nested user namespaces and
