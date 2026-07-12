@@ -2,15 +2,31 @@
   description = "presto-pasta - user-mode NAT datapath for sandboxes";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.treefmt-nix = {
+    url = "github:numtide/treefmt-nix";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
 
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      treefmt-nix,
+    }:
     let
       systems = [
         "x86_64-linux"
         "aarch64-linux"
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      treefmtFor = forAllSystems (
+        pkgs:
+        treefmt-nix.lib.evalModule pkgs {
+          projectRootFile = "flake.nix";
+          programs.nixfmt.enable = true;
+          programs.rustfmt.enable = true;
+        }
+      );
     in
     {
       packages = forAllSystems (pkgs: {
@@ -19,6 +35,14 @@
           version = "0.1.0";
           src = self;
           cargoLock.lockFile = ./Cargo.lock;
+          # The netns integration tests need nested user namespaces and
+          # /dev/net/tun, which the Nix build sandbox does not provide;
+          # run them from the dev shell instead.
+          checkFlags = [
+            "--skip=datapath"
+            "--skip=flow_filter"
+            "--skip=lossy_download"
+          ];
         };
 
         # QUIC throughput tool (iperf-like, quicly based) used by the
@@ -51,6 +75,24 @@
         };
       });
 
+      checks = forAllSystems (
+        pkgs:
+        let
+          packages = self.packages.${pkgs.stdenv.hostPlatform.system};
+        in
+        {
+          inherit (packages) default qperf;
+          clippy = packages.default.overrideAttrs (old: {
+            pname = "presto-pasta-clippy";
+            nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.clippy ];
+            buildPhase = "cargo clippy --all-targets -- -D warnings";
+            doCheck = false;
+            installPhase = "touch $out";
+          });
+          formatting = treefmtFor.${pkgs.stdenv.hostPlatform.system}.config.build.check self;
+        }
+      );
+
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           packages = with pkgs; [
@@ -72,6 +114,8 @@
         };
       });
 
-      formatter = forAllSystems (pkgs: pkgs.nixfmt-rfc-style);
+      formatter = forAllSystems (
+        pkgs: treefmtFor.${pkgs.stdenv.hostPlatform.system}.config.build.wrapper
+      );
     };
 }

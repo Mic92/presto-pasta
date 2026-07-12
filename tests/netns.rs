@@ -195,7 +195,11 @@ fn setup_and_pass_tap() -> OwnedFd {
 
 /// Spawn the sandbox role, receive the tap fd it configured, and start
 /// presto-pasta on it. Returns the sandbox child to wait on.
-fn spawn_sandbox_with_presto(role: &str, test: &str) -> std::process::Child {
+fn spawn_sandbox_with_presto(
+    role: &str,
+    test: &str,
+    cfg: presto_pasta::Config,
+) -> std::process::Child {
     let (ours, theirs) = socketpair(
         AddressFamily::Unix,
         SockType::Datagram,
@@ -222,7 +226,7 @@ fn spawn_sandbox_with_presto(role: &str, test: &str) -> std::process::Child {
         other => panic!("expected SCM_RIGHTS, got {other:?}"),
     };
 
-    let presto = presto_pasta::Presto::new(presto_pasta::Config::default(), tap_fd);
+    let presto = presto_pasta::Presto::new(cfg, tap_fd);
     let datapath_cpu = bench_cpus().map(|c| c[1].clone());
     std::thread::spawn(move || {
         if let Some(cpu) = datapath_cpu
@@ -312,7 +316,8 @@ fn host() -> ! {
         });
     }
 
-    let mut child = spawn_sandbox_with_presto("sandbox", "datapath");
+    let mut child =
+        spawn_sandbox_with_presto("sandbox", "datapath", presto_pasta::Config::default());
     let status = child.wait().expect("wait sandbox");
     exit(i32::from(!status.success()));
 }
@@ -462,7 +467,7 @@ fn iperf3_bench_host(sandbox_role: &str, test: &str, pasta_role: &str) -> ! {
         .spawn()
         .expect("start iperf3 server");
 
-    let mut child = spawn_sandbox_with_presto(sandbox_role, test);
+    let mut child = spawn_sandbox_with_presto(sandbox_role, test, presto_pasta::Config::default());
     let presto_ok = child.wait().expect("wait bench sandbox").success();
 
     let pasta_ok = client_via_pasta(test, pasta_role);
@@ -517,7 +522,11 @@ fn quic_host() -> ! {
         .spawn()
         .expect("start qperf server");
 
-    let mut child = spawn_sandbox_with_presto("quic-sandbox", "bench_quic");
+    let mut child = spawn_sandbox_with_presto(
+        "quic-sandbox",
+        "bench_quic",
+        presto_pasta::Config::default(),
+    );
     let presto_ok = child.wait().expect("wait quic sandbox").success();
 
     let pasta_ok = client_via_pasta("bench_quic", "quic-pasta");
@@ -602,7 +611,11 @@ fn loss_host() -> ! {
             let _ = conn.write_all(&payload);
         }
     });
-    let mut child = spawn_sandbox_with_presto("loss-sandbox", "lossy_download");
+    let mut child = spawn_sandbox_with_presto(
+        "loss-sandbox",
+        "lossy_download",
+        presto_pasta::Config::default(),
+    );
     let status = child.wait().expect("wait sandbox");
     exit(i32::from(!status.success()));
 }
@@ -673,4 +686,71 @@ fn datapath() {
         _ => {}
     }
     run_in_userns("host", "datapath");
+}
+
+/// Host namespace for the flow filter test: echo services on 10.0.0.1,
+/// presto-pasta configured with a policy that refuses TCP to port 7878.
+fn filter_host() -> ! {
+    ip("link set lo up");
+    ip("addr add 10.0.0.1/32 dev lo");
+
+    let echo = UdpSocket::bind("10.0.0.1:7777").expect("bind echo");
+    std::thread::spawn(move || {
+        let mut b = [0u8; 2048];
+        while let Ok((n, peer)) = echo.recv_from(&mut b) {
+            let _ = echo.send_to(&b[..n], peer);
+        }
+    });
+    let _listener = TcpListener::bind("10.0.0.1:7878").expect("bind tcp");
+
+    let cfg = presto_pasta::Config {
+        allow_flow: Some(std::sync::Arc::new(|dst: &presto_pasta::FlowDst| {
+            !(dst.proto == presto_pasta::proto::IPPROTO_TCP && dst.port == 7878)
+        })),
+        ..presto_pasta::Config::default()
+    };
+    let mut child = spawn_sandbox_with_presto("filter-sandbox", "flow_filter", cfg);
+    let status = child.wait().expect("wait sandbox");
+    exit(i32::from(!status.success()));
+}
+
+/// Sandbox namespace: UDP passes the filter, the refused TCP flow never
+/// gets a SYN-ACK so the connect times out.
+fn filter_sandbox() -> ! {
+    let _tap_fd = setup_and_pass_tap();
+
+    let sock = UdpSocket::bind("0.0.0.0:0").expect("bind in sandbox");
+    sock.connect("10.0.0.1:7777").expect("connect");
+    sock.set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let mut reply = [0u8; 16];
+    let mut ok = false;
+    for _ in 0..20 {
+        sock.send(b"hello").expect("send");
+        if let Ok(n) = sock.recv(&mut reply) {
+            assert_eq!(&reply[..n], b"hello");
+            ok = true;
+            break;
+        }
+    }
+    assert!(ok, "allowed UDP flow got no echo reply");
+
+    let refused = TcpStream::connect_timeout(
+        &"10.0.0.1:7878".parse().unwrap(),
+        Duration::from_millis(500),
+    );
+    assert!(refused.is_err(), "filtered TCP flow unexpectedly connected");
+    exit(0);
+}
+
+/// The `Config::allow_flow` policy refuses flows before a host socket
+/// is created for them.
+#[test]
+fn flow_filter() {
+    match std::env::var(ROLE).as_deref() {
+        Ok("filter-host") => filter_host(),
+        Ok("filter-sandbox") => filter_sandbox(),
+        _ => {}
+    }
+    run_in_userns("filter-host", "flow_filter");
 }
