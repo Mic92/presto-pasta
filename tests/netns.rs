@@ -688,6 +688,86 @@ fn datapath() {
     run_in_userns("host", "datapath");
 }
 
+/// Host namespace for the NAT64 test: services listen only on an IPv6
+/// address that embeds 10.0.0.1 into the `fd00:64::/96` prefix; there is
+/// no IPv4 service at all, mirroring an IPv6-only host.
+fn nat64_host() -> ! {
+    allow_ping_sockets();
+    ip("link set lo up");
+    ip("addr add fd00:64::a00:1/128 dev lo nodad");
+
+    let echo = UdpSocket::bind("[fd00:64::a00:1]:7777").expect("bind echo");
+    std::thread::spawn(move || {
+        let mut b = [0u8; 2048];
+        while let Ok((n, peer)) = echo.recv_from(&mut b) {
+            let _ = echo.send_to(&b[..n], peer);
+        }
+    });
+    let listener = TcpListener::bind("[fd00:64::a00:1]:7878").expect("bind tcp echo");
+    std::thread::spawn(move || {
+        for conn in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut rx = conn;
+                let mut tx = rx.try_clone().expect("clone conn");
+                let mut b = vec![0u8; 64 * 1024];
+                while let Ok(n) = rx.read(&mut b) {
+                    if n == 0 || tx.write_all(&b[..n]).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    let cfg = presto_pasta::Config {
+        nat64_prefix: Some("fd00:64::".parse().unwrap()),
+        ..presto_pasta::Config::default()
+    };
+    let mut child = spawn_sandbox_with_presto("nat64-sandbox", "nat64", cfg);
+    let status = child.wait().expect("wait sandbox");
+    exit(i32::from(!status.success()));
+}
+
+/// Sandbox namespace: plain IPv4 UDP, TCP and ICMP echo traffic that
+/// only works if presto-pasta translates it to the IPv6-only host side.
+fn nat64_sandbox() -> ! {
+    allow_ping_sockets();
+    let _tap_fd = setup_and_pass_tap();
+
+    let sock = UdpSocket::bind("0.0.0.0:0").expect("bind in sandbox");
+    sock.connect("10.0.0.1:7777").expect("connect");
+    sock.set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let mut reply = [0u8; 16];
+    let mut ok = false;
+    for _ in 0..20 {
+        sock.send(b"hello").expect("send");
+        if let Ok(n) = sock.recv(&mut reply) {
+            assert_eq!(&reply[..n], b"hello", "NAT64 UDP echo mismatch");
+            ok = true;
+            break;
+        }
+    }
+    assert!(ok, "no NAT64 UDP echo reply");
+
+    assert!(ping("10.0.0.1"), "no NAT64 ICMP echo reply");
+
+    tcp_echo("10.0.0.1:7878");
+    exit(0);
+}
+
+/// IPv4 guest traffic reaches an IPv6-only host through the configured
+/// NAT64 prefix.
+#[test]
+fn nat64() {
+    match std::env::var(ROLE).as_deref() {
+        Ok("nat64-host") => nat64_host(),
+        Ok("nat64-sandbox") => nat64_sandbox(),
+        _ => {}
+    }
+    run_in_userns("nat64-host", "nat64");
+}
+
 /// Host namespace for the flow filter test: echo services on 10.0.0.1,
 /// presto-pasta configured with a policy that refuses TCP to port 7878.
 fn filter_host() -> ! {

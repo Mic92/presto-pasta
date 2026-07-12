@@ -398,6 +398,12 @@ impl EventLoop {
         if echo.icmp_type != expected {
             return;
         }
+        // Under NAT64 the ping socket speaks ICMPv6, so the guest's
+        // ICMPv4 echo request becomes an ICMPv6 one (the kernel fills
+        // in identifier and checksum on send).
+        if g.dst_ip.is_ipv4() && self.cfg.nat64_prefix.is_some() {
+            self.pool.get_mut(self.tap_buf)[g.l4.start] = proto::ICMPV6_ECHO_REQUEST;
+        }
         let key = flow::FlowKey {
             proto: g.proto,
             guest_port: echo.id,
@@ -443,6 +449,7 @@ impl EventLoop {
                 } else {
                     key.dst
                 };
+                let target = self.cfg.nat64_target(target);
                 let bind_ip: IpAddr = if target.is_ipv4() {
                     std::net::Ipv4Addr::UNSPECIFIED.into()
                 } else {
@@ -455,8 +462,9 @@ impl EventLoop {
             flow::FlowKind::Ping => {
                 // Requires net.ipv4.ping_group_range to cover our gid;
                 // echo is silently unavailable otherwise.
-                let sock = ping_socket(key.dst.ip())?;
-                sock.connect(key.dst).ok()?;
+                let target = self.cfg.nat64_target(SocketAddr::new(key.dst.ip(), 0));
+                let sock = ping_socket(target.ip())?;
+                sock.connect(target).ok()?;
                 sock
             }
             flow::FlowKind::Tcp => unreachable!("TCP flows are created by new_tcp_flow"),
@@ -598,6 +606,15 @@ impl EventLoop {
                 if len < proto::ICMP_HDR_LEN {
                     return;
                 }
+                // Under NAT64 the ping socket delivers an ICMPv6 echo
+                // reply; turn it back into ICMPv4 for the guest
+                // (patch_id recomputes the checksum).
+                if key.dst.is_ipv4() && self.cfg.nat64_prefix.is_some() {
+                    if b[l4_start] != proto::ICMPV6_ECHO_REPLY {
+                        return;
+                    }
+                    b[l4_start] = proto::ICMP_ECHO_REPLY;
+                }
                 proto::IcmpEcho::patch_id(&mut b[l4_start..end], key.guest_port, pseudo);
             }
             flow::FlowKind::Tcp => return,
@@ -662,7 +679,10 @@ impl EventLoop {
         if !self.flow_allowed(&key) {
             return None; // no SYN-ACK; the guest times out
         }
-        let family = if key.dst.is_ipv4() {
+        // The host socket connects to the (possibly NAT64-mapped)
+        // target; guest-facing framing keeps using key.dst.
+        let target = self.cfg.nat64_target(key.dst);
+        let family = if target.is_ipv4() {
             AddressFamily::Inet
         } else {
             AddressFamily::Inet6
@@ -679,7 +699,7 @@ impl EventLoop {
         // read it) caps upload throughput at window/loop-latency, so
         // ask for a larger buffer up front.
         let _ = setsockopt(&sock, sockopt::SndBuf, &(4 * 1024 * 1024));
-        match connect(sock.as_raw_fd(), &SockaddrStorage::from(key.dst)) {
+        match connect(sock.as_raw_fd(), &SockaddrStorage::from(target)) {
             Ok(()) | Err(nix::errno::Errno::EINPROGRESS) => {}
             Err(_) => return None, // no SYN-ACK; the guest times out
         }
