@@ -206,7 +206,18 @@ fn spawn_sandbox_with_presto(role: &str, test: &str) -> std::process::Child {
     };
 
     let presto = presto::Presto::new(presto::Config::default(), tap_fd);
-    std::thread::spawn(move || presto.run().expect("presto run"));
+    let datapath_cpu = bench_cpus().map(|c| c[1].clone());
+    std::thread::spawn(move || {
+        if let Some(cpu) = datapath_cpu
+            && let Ok(cpu) = cpu.parse()
+        {
+            let mut set = nix::sched::CpuSet::new();
+            set.set(cpu).expect("cpu id in range");
+            nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &set)
+                .expect("pin datapath thread");
+        }
+        presto.run().expect("presto run");
+    });
     child
 }
 
@@ -289,12 +300,36 @@ fn host() -> ! {
     exit(i32::from(!status.success()));
 }
 
+/// CPUs to pin the benchmark onto, from `PRESTO_BENCH_CPUS` as
+/// "server,datapath,client". Pinning the three busiest actors to fixed
+/// cores removes most of the run-to-run variance the scheduler causes
+/// on large machines.
+fn bench_cpus() -> Option<[String; 3]> {
+    let val = std::env::var("PRESTO_BENCH_CPUS").ok()?;
+    let mut parts = val.split(',').map(str::to_owned);
+    let cpus = [parts.next()?, parts.next()?, parts.next()?];
+    Some(cpus)
+}
+
+/// Command wrapped in `taskset -c cpu` when a CPU is given.
+fn pinned(cpu: Option<&str>, program: &str) -> Command {
+    match cpu {
+        Some(cpu) => {
+            let mut cmd = Command::new("taskset");
+            cmd.args(["-c", cpu, program]);
+            cmd
+        }
+        None => Command::new(program),
+    }
+}
+
 /// Run the iperf3 client against the host-side server, once in each
 /// direction, labelling the output.
 fn iperf3_client(label: &str) {
+    let cpus = bench_cpus();
     for (dir, extra) in [("upload", &[][..]), ("download", &["-R"][..])] {
         println!("=== {label} {dir} ===");
-        let status = Command::new("iperf3")
+        let status = pinned(cpus.as_ref().map(|c| c[2].as_str()), "iperf3")
             .args(["-c", "10.0.0.1", "-t", "5", "-f", "g"])
             .args(extra)
             .status()
@@ -328,7 +363,8 @@ fn bench_host() -> ! {
     ip("link set lo up");
     ip("addr add 10.0.0.1/32 dev lo");
 
-    let mut server = Command::new("iperf3")
+    let cpus = bench_cpus();
+    let mut server = pinned(cpus.as_ref().map(|c| c[0].as_str()), "iperf3")
         .args(["-s", "-B", "10.0.0.1"])
         .stdout(std::process::Stdio::null())
         .spawn()
@@ -339,7 +375,7 @@ fn bench_host() -> ! {
 
     // Same measurement through pasta, invoked the way sandbox runners
     // do (private netns, no port forwarding).
-    let pasta_ok = Command::new("pasta")
+    let pasta_ok = pinned(cpus.as_ref().map(|c| c[1].as_str()), "pasta")
         .args([
             "--config-net",
             "--quiet",

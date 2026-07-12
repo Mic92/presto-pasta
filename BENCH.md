@@ -25,6 +25,13 @@ perf record -g --call-graph dwarf -p <pid> -- sleep 4
 perf report --stdio --no-children
 ```
 
+## Reducing noise
+
+Set `PRESTO_BENCH_CPUS=<server>,<datapath>,<client>` to pin the iperf3
+server, the datapath (presto thread or pasta process) and the iperf3
+client to fixed cores. Without pinning, scheduler placement on large
+machines swings results by a factor of two between runs.
+
 ## Datapath counters and captures
 
 Build with `--features stats` to get event counters on stderr whenever
@@ -34,9 +41,10 @@ guest side of the tap with tcpdump during the bench.
 ## Results
 
 AMD EPYC 9654 (idle), Linux 7.1, 2026-07-12, defaults (64 buffers,
-single thread), tap MTU 65520, 5 s per direction, median of 5 runs:
+single thread), tap MTU 65520, `PRESTO_BENCH_CPUS=2,4,6`, 5 s per
+direction, median of 5 runs:
 
 | direction               | presto        | pasta         |
 | ----------------------- | ------------- | ------------- |
-| upload (guest → host)   | 14.3 Gbits/s  | 19.1 Gbits/s  |
-| download (host → guest) | 12.3 Gbits/s  | 6.8 Gbits/s   |
+| upload (guest → host)   | 25.3 Gbits/s  | 28.0 Gbits/s  |
+| download (host → guest) | 11.2 Gbits/s  | 17.2 Gbits/s  |
