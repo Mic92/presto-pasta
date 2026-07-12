@@ -16,8 +16,8 @@ use std::process::{Command, exit};
 use std::time::Duration;
 
 use nix::sys::socket::{
-    AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag, SockType, recvmsg,
-    sendmsg, socketpair,
+    AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag, SockProtocol, SockType,
+    recvmsg, sendmsg, socket, socketpair,
 };
 
 const ROLE: &str = "PRESTO_ROLE";
@@ -47,6 +47,40 @@ fn open_tap(name: &str) -> io::Result<OwnedFd> {
     ifr.ifr_ifru.ifru_flags = IFF_TAP | IFF_NO_PI | IFF_VNET_HDR;
     unsafe { tun_set_iff(file.as_raw_fd(), &raw const ifr) }.map_err(io::Error::from)?;
     Ok(OwnedFd::from(file))
+}
+
+fn allow_ping_sockets() {
+    // Only gid 0 is mapped in the user namespace; wider ranges are
+    // rejected with EINVAL.
+    std::fs::write("/proc/sys/net/ipv4/ping_group_range", "0 0").expect("enable ping sockets");
+}
+
+/// Send one ICMP echo request over an unprivileged ping socket and wait
+/// for the reply.
+fn ping(dst: &str) -> bool {
+    let v4 = !dst.contains(':');
+    let (family, proto) = if v4 {
+        (AddressFamily::Inet, SockProtocol::Icmp)
+    } else {
+        (AddressFamily::Inet6, SockProtocol::IcmpV6)
+    };
+    let fd =
+        socket(family, SockType::Datagram, SockFlag::SOCK_CLOEXEC, proto).expect("ping socket");
+    let sock = UdpSocket::from(fd);
+    sock.connect((dst, 0)).expect("connect ping socket");
+    sock.set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let echo_request = if v4 { 8u8 } else { 128 };
+    // type, code, checksum (kernel), id (kernel), seq 1, payload
+    let req = [echo_request, 0, 0, 0, 0, 0, 0, 1, 0xaa, 0xbb];
+    let mut reply = [0u8; 64];
+    for _ in 0..20 {
+        sock.send(&req).expect("send echo request");
+        if let Ok(n) = sock.recv(&mut reply) {
+            return n == req.len() && reply[8..10] == [0xaa, 0xbb];
+        }
+    }
+    false
 }
 
 fn ip(args: &str) {
@@ -86,6 +120,7 @@ fn sandbox() -> ! {
     ip(
         "neigh add 64:ff9b:1:4b8e:472e:a5c8:a9fe:101 lladdr 9a:55:9a:55:9a:55 dev eth0 nud permanent",
     );
+    allow_ping_sockets();
 
     let pass_fd: RawFd = std::env::var(PASS_FD).unwrap().parse().unwrap();
     let pass = unsafe { BorrowedFd::borrow_raw(pass_fd) };
@@ -123,11 +158,16 @@ fn sandbox() -> ! {
         }
         assert!(ok, "no echo reply from {target}");
     }
+
+    for dst in ["10.0.0.1", "fd00::1"] {
+        assert!(ping(dst), "no ICMP echo reply from {dst}");
+    }
     exit(0);
 }
 
 /// Host namespace: run the echo services and presto, spawn the sandbox.
 fn host() -> ! {
+    allow_ping_sockets();
     ip("link set lo up");
     ip("addr add 10.0.0.1/32 dev lo");
     ip("addr add fd00::1/128 dev lo nodad");

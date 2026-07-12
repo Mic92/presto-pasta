@@ -15,6 +15,10 @@ pub const IPPROTO_TCP: u8 = 6;
 pub const IPPROTO_UDP: u8 = 17;
 pub const IPPROTO_ICMPV6: u8 = 58;
 
+pub const ICMP_HDR_LEN: usize = 8;
+pub const ICMP_ECHO_REQUEST: u8 = 8;
+pub const ICMPV6_ECHO_REQUEST: u8 = 128;
+
 /// Ethernet header of a frame (after the vnet header).
 #[derive(Debug, Clone, Copy)]
 pub struct EthHdr {
@@ -125,6 +129,36 @@ impl Ipv6Hdr {
         out[7] = 64; // hop limit
         out[8..24].copy_from_slice(&src.octets());
         out[24..40].copy_from_slice(&dst.octets());
+    }
+}
+
+/// ICMP/ICMPv6 echo header view; only messages with code 0 parse.
+#[derive(Debug, Clone, Copy)]
+pub struct IcmpEcho {
+    pub icmp_type: u8,
+    pub id: u16,
+}
+
+impl IcmpEcho {
+    #[must_use]
+    pub fn parse(b: &[u8]) -> Option<Self> {
+        if b.len() < ICMP_HDR_LEN || b[1] != 0 {
+            return None;
+        }
+        Some(Self {
+            icmp_type: b[0],
+            id: u16::from_be_bytes([b[4], b[5]]),
+        })
+    }
+
+    /// Rewrite the echo identifier of the ICMP message in `msg` and
+    /// recompute its checksum. `pseudo` is zero for `ICMPv4` and the
+    /// pseudo-header sum for `ICMPv6`.
+    pub fn patch_id(msg: &mut [u8], id: u16, pseudo: u32) {
+        msg[4..6].copy_from_slice(&id.to_be_bytes());
+        msg[2..4].copy_from_slice(&[0, 0]);
+        let csum = checksum(msg, pseudo);
+        msg[2..4].copy_from_slice(&csum.to_be_bytes());
     }
 }
 
