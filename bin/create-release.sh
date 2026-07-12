@@ -34,11 +34,6 @@ if [[ -n $uncommitted_changes ]]; then
   exit 1
 fi
 git pull git@github.com:Mic92/presto-pasta main
-unpushed_commits=$(git log --format=oneline origin/main..main)
-if [[ $unpushed_commits != "" ]]; then
-  echo -e "\nThere are unpushed changes, exiting:\n$unpushed_commits" >&2
-  exit 1
-fi
 # make sure tag does not exist
 if git tag -l | grep -q "^v${version}\$"; then
   echo "Tag v${version} already exists, exiting" >&2
