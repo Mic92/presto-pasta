@@ -1,4 +1,4 @@
-# presto — design
+# presto-pasta — design
 
 User-mode NAT datapath for sandboxes. Library only, no CLI.
 
@@ -9,23 +9,23 @@ port forwarding.
 ## Model
 
 Same translation model as pasta: the host kernel runs the real TCP
-stack; presto moves bytes between an L2 tap device and native host
+stack; presto-pasta moves bytes between an L2 tap device and native host
 sockets, rewriting headers. No user-space retransmit/congestion logic.
 
-Unlike pasta, presto does not attach to a foreign netns. The caller
+Unlike pasta, presto-pasta does not attach to a foreign netns. The caller
 owns the sandbox: it creates the netns, opens the tap inside it,
 configures addresses, routes, a permanent neighbor entry for the
-gateway MAC, and resolv.conf pointing at the gateway, then hands presto
-the tap fd. presto is a pure datapath over that fd.
+gateway MAC, and resolv.conf pointing at the gateway, then hands presto-pasta
+the tap fd. presto-pasta is a pure datapath over that fd.
 
-Not in presto because of this: setns/userns handling, netlink
+Not in presto-pasta because of this: setns/userns handling, netlink
 configuration, ARP/NDP responders, readiness barriers, privilege drop.
-The caller runs presto under whatever uid and seccomp policy it wants;
+The caller runs presto-pasta under whatever uid and seccomp policy it wants;
 a built-in seccomp filter is an optional feature.
 
 ## Datapath
 
-1. **Tap offloads.** Caller opens the tap with `IFF_VNET_HDR`; presto
+1. **Tap offloads.** Caller opens the tap with `IFF_VNET_HDR`; presto-pasta
    probes TSO4/TSO6/USO/CSUM via `TUNSETOFFLOAD` (USO needs kernel
    ≥ 6.2) and checksums in software when CSUM is unavailable. Frame
    sizing follows the vnet header, not the interface MTU; buffers hold
@@ -49,7 +49,7 @@ a built-in seccomp filter is an optional feature.
   excludes the caller's gid, echo is disabled instead of failing
 - DNS forwarding: queries to the gateway address go to the host
   resolver; resolv.conf re-read on change; loopback resolvers
-  (127.0.0.53) work because presto's sockets are in the host netns
+  (127.0.0.53) work because presto-pasta's sockets are in the host netns
 - liveness event fd on the handle so a supervisor can fail the job when
   the event loop exits
 
@@ -60,9 +60,9 @@ pcap.
 ## API
 
 ```rust
-let presto = presto::Presto::new(presto::Config::default(), tap_fd)?;
-let liveness = presto.liveness_fd();
-presto.run()?; // until the tap fd is torn down
+let presto-pasta = presto_pasta::Presto::new(presto_pasta::Config::default(), tap_fd)?;
+let liveness = presto-pasta.liveness_fd();
+presto-pasta.run()?; // until the tap fd is torn down
 ```
 
 `Config`: gateway/guest addresses (to synthesize headers and recognize

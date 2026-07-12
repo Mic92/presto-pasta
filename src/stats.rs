@@ -94,12 +94,12 @@ mod imp {
         pub fn dump(&self) {
             let per = |n: u64| n as f64 / self.wakeups.max(1) as f64;
             eprintln!(
-                "presto stats: wakeups {} cqes/wakeup {:.2}",
+                "presto-pasta stats: wakeups {} cqes/wakeup {:.2}",
                 self.wakeups,
                 per(self.cqes)
             );
             eprintln!(
-                "presto stats: tap in {} frames {} bytes ({:.2} frames/wakeup), out {} frames {} bytes",
+                "presto-pasta stats: tap in {} frames {} bytes ({:.2} frames/wakeup), out {} frames {} bytes",
                 self.tap_frames_in,
                 self.tap_bytes_in,
                 per(self.tap_frames_in),
@@ -107,19 +107,19 @@ mod imp {
                 self.tap_bytes_out
             );
             eprintln!(
-                "presto stats: tcp ctrl frames {} acks deferred {}",
+                "presto-pasta stats: tcp ctrl frames {} acks deferred {}",
                 self.tcp_ctrl_frames, self.acks_deferred
             );
             eprintln!(
-                "presto stats: sock sends {} bytes {} shortfall {}",
+                "presto-pasta stats: sock sends {} bytes {} shortfall {}",
                 self.sock_sends, self.sock_send_bytes, self.sock_send_shortfall
             );
             eprintln!(
-                "presto stats: sock recvs {} empty {}",
+                "presto-pasta stats: sock recvs {} empty {}",
                 self.sock_recvs, self.sock_recvs_empty
             );
             eprintln!(
-                "presto stats: guest window last {} max {}, window full {} budget short {} dup-ack retransmits {} rto retransmits {}",
+                "presto-pasta stats: guest window last {} max {}, window full {} budget short {} dup-ack retransmits {} rto retransmits {}",
                 self.guest_window_last,
                 self.guest_window_max,
                 self.window_full,

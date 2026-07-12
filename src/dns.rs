@@ -3,7 +3,7 @@
 use std::net::{IpAddr, SocketAddr};
 
 /// First nameserver from /etc/resolv.conf, port 53. Loopback resolvers
-/// work because presto's sockets live in the host netns.
+/// work because presto-pasta's sockets live in the host netns.
 #[must_use]
 pub fn host_resolver() -> Option<SocketAddr> {
     parse(&std::fs::read_to_string("/etc/resolv.conf").ok()?)

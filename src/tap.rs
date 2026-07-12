@@ -1,7 +1,7 @@
 //! Tap device fd handling: offload probing and vnet header framing.
 //!
 //! The caller opens the device inside the sandbox netns with
-//! `IFF_TAP | IFF_NO_PI | IFF_VNET_HDR` and hands presto the fd.
+//! `IFF_TAP | IFF_NO_PI | IFF_VNET_HDR` and hands presto-pasta the fd.
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 

@@ -1,5 +1,5 @@
 {
-  description = "presto - user-mode NAT datapath for sandboxes";
+  description = "presto-pasta - user-mode NAT datapath for sandboxes";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -15,7 +15,7 @@
     {
       packages = forAllSystems (pkgs: {
         default = pkgs.rustPlatform.buildRustPackage {
-          pname = "presto";
+          pname = "presto-pasta";
           version = "0.1.0";
           src = self;
           cargoLock.lockFile = ./Cargo.lock;

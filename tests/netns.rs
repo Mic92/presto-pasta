@@ -1,5 +1,5 @@
 //! End-to-end harness with two namespaces, mirroring real deployment:
-//! a "host" user+net namespace where presto and the reachable services
+//! a "host" user+net namespace where presto-pasta and the reachable services
 //! live, and a nested "sandbox" namespace that owns the tap device and
 //! generates guest traffic.
 //!
@@ -7,7 +7,7 @@
 //! --net` twice (roles selected via `PRESTO_ROLE`); the sandbox child
 //! opens and configures the tap the way a sandbox runner would and
 //! passes the fd to the host side over a unix socketpair. This doubles
-//! as the reference for integrating presto into a sandbox runner.
+//! as the reference for integrating presto-pasta into a sandbox runner.
 
 use std::io;
 use std::io::{Read, Write};
@@ -56,7 +56,7 @@ fn allow_ping_sockets() {
     std::fs::write("/proc/sys/net/ipv4/ping_group_range", "0 0").expect("enable ping sockets");
 }
 
-/// Bulk TCP echo through presto: connect, stream 1 MiB, read it back.
+/// Bulk TCP echo through presto-pasta: connect, stream 1 MiB, read it back.
 fn tcp_echo(target: &str) {
     let mut stream = connect_with_retry(target);
     stream
@@ -83,7 +83,7 @@ fn tcp_echo(target: &str) {
     assert_eq!(echoed, payload, "echo content from {target}");
 }
 
-/// Connect through presto, retrying while it is still starting up.
+/// Connect through presto-pasta, retrying while it is still starting up.
 fn connect_with_retry(target: &str) -> TcpStream {
     for _ in 0..20 {
         if let Ok(s) = TcpStream::connect(target) {
@@ -158,7 +158,7 @@ fn reexec_unshared(role: &str, test: &str, extra_env: &[(&str, String)]) -> Comm
 }
 
 /// Configure the tap the way a sandbox runner would before handing the
-/// fd to presto, and pass it to the host side over the unix socket.
+/// fd to presto-pasta, and pass it to the host side over the unix socket.
 fn setup_and_pass_tap() -> OwnedFd {
     let tap_fd = open_tap("eth0").expect("open tap");
 
@@ -194,7 +194,7 @@ fn setup_and_pass_tap() -> OwnedFd {
 }
 
 /// Spawn the sandbox role, receive the tap fd it configured, and start
-/// presto on it. Returns the sandbox child to wait on.
+/// presto-pasta on it. Returns the sandbox child to wait on.
 fn spawn_sandbox_with_presto(role: &str, test: &str) -> std::process::Child {
     let (ours, theirs) = socketpair(
         AddressFamily::Unix,
@@ -222,7 +222,7 @@ fn spawn_sandbox_with_presto(role: &str, test: &str) -> std::process::Child {
         other => panic!("expected SCM_RIGHTS, got {other:?}"),
     };
 
-    let presto = presto::Presto::new(presto::Config::default(), tap_fd);
+    let presto = presto_pasta::Presto::new(presto_pasta::Config::default(), tap_fd);
     let datapath_cpu = bench_cpus().map(|c| c[1].clone());
     std::thread::spawn(move || {
         if let Some(cpu) = datapath_cpu
@@ -233,13 +233,13 @@ fn spawn_sandbox_with_presto(role: &str, test: &str) -> std::process::Child {
             nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &set)
                 .expect("pin datapath thread");
         }
-        presto.run().expect("presto run");
+        presto.run().expect("presto-pasta run");
     });
     child
 }
 
 /// Sandbox namespace: open + configure the tap, hand the fd to the host
-/// side, then exercise UDP through presto.
+/// side, then exercise UDP through presto-pasta.
 fn sandbox() -> ! {
     allow_ping_sockets();
     let _tap_fd = setup_and_pass_tap();
@@ -277,7 +277,7 @@ fn sandbox() -> ! {
     exit(0);
 }
 
-/// Host namespace: run the echo services and presto, spawn the sandbox.
+/// Host namespace: run the echo services and presto-pasta, spawn the sandbox.
 fn host() -> ! {
     allow_ping_sockets();
     ip("link set lo up");
@@ -378,7 +378,7 @@ fn iperf3_udp_client(label: &str) {
 /// iperf3 in UDP mode.
 fn udp_sandbox() -> ! {
     let _tap_fd = setup_and_pass_tap();
-    iperf3_udp_client("presto");
+    iperf3_udp_client("presto-pasta");
     exit(0);
 }
 
@@ -414,7 +414,7 @@ fn bench_sandbox() -> ! {
             .spawn()
             .ok()
     });
-    iperf3_client("presto");
+    iperf3_client("presto-pasta");
     if let Some(child) = tcpdump.as_mut() {
         let _ = child.kill();
         let _ = child.wait();
@@ -449,7 +449,7 @@ fn client_via_pasta(test: &str, role: &str) -> bool {
 }
 
 /// Bench host namespace shared by the TCP and UDP iperf3 benchmarks:
-/// iperf3 server plus presto, then the same measurement through pasta
+/// iperf3 server plus presto-pasta, then the same measurement through pasta
 /// attached to its own namespace.
 fn iperf3_bench_host(sandbox_role: &str, test: &str, pasta_role: &str) -> ! {
     ip("link set lo up");
@@ -488,11 +488,11 @@ fn qperf_client(label: &str) {
 /// qperf.
 fn quic_sandbox() -> ! {
     let _tap_fd = setup_and_pass_tap();
-    qperf_client("presto");
+    qperf_client("presto-pasta");
     exit(0);
 }
 
-/// QUIC bench host namespace: qperf server plus presto, then the same
+/// QUIC bench host namespace: qperf server plus presto-pasta, then the same
 /// measurement through pasta.
 fn quic_host() -> ! {
     ip("link set lo up");
@@ -500,11 +500,11 @@ fn quic_host() -> ! {
 
     // qperf expects server.crt/server.key in its working directory;
     // the client does not validate them.
-    let dir = std::env::temp_dir().join(format!("presto-qperf-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("presto-pasta-qperf-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create qperf dir");
     let status = Command::new("openssl")
         .current_dir(&dir)
-        .args("req -x509 -newkey rsa:2048 -nodes -keyout server.key -out server.crt -days 1 -subj /CN=presto-bench".split_whitespace())
+        .args("req -x509 -newkey rsa:2048 -nodes -keyout server.key -out server.crt -days 1 -subj /CN=presto-pasta-bench".split_whitespace())
         .status()
         .expect("run openssl");
     assert!(status.success(), "generate qperf certificate");
@@ -553,7 +553,7 @@ fn bench_quic() {
 const LOSSY_LEN: usize = 8 * 1024 * 1024;
 
 /// Sandbox namespace for the frame-loss test: drop 10% of the packets
-/// presto sends towards the guest and check a bulk download still
+/// presto-pasta sends towards the guest and check a bulk download still
 /// completes; only the retransmission timeout recovers a loss at the
 /// tail of a burst.
 fn loss_sandbox() -> ! {

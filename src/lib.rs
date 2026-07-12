@@ -1,8 +1,8 @@
-//! presto: user-mode NAT datapath for sandboxes.
+//! presto-pasta: user-mode NAT datapath for sandboxes.
 //!
 //! Translates L2 frames on a caller-provided tap fd to native host
 //! sockets (outbound TCP/UDP, ICMP echo, DNS forwarding). The host
-//! kernel runs the real TCP stack; presto only rewrites headers and
+//! kernel runs the real TCP stack; presto-pasta only rewrites headers and
 //! moves payload. The caller owns the network namespace and the tap
 //! device configuration. See DESIGN.md.
 
@@ -20,7 +20,7 @@ mod stats;
 pub mod tap;
 pub mod uring;
 
-/// Addresses presto uses to synthesize headers and to recognize
+/// Addresses presto-pasta uses to synthesize headers and to recognize
 /// gateway-addressed traffic (DNS). Must match what the caller
 /// configured on the tap interface.
 #[derive(Debug, Clone)]
