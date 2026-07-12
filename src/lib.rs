@@ -110,8 +110,10 @@ pub struct Config {
     /// NAT64 /96 prefix for IPv6-only hosts (CLAT-style). When set,
     /// IPv4 destinations from the guest are embedded into this prefix
     /// (RFC 6052) and the host sockets use IPv6; the guest keeps
-    /// speaking plain IPv4. The well-known prefix is `64:ff9b::`.
-    /// [`Config::allow_flow`] still sees the guest's IPv4 destination.
+    /// speaking plain IPv4. The well-known prefix is `64:ff9b::`;
+    /// [`dns::discover_nat64_prefix`] finds the host resolver's prefix
+    /// via DNS64. [`Config::allow_flow`] still sees the guest's IPv4
+    /// destination.
     pub nat64_prefix: Option<Ipv6Addr>,
 }
 
