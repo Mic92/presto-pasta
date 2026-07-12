@@ -16,6 +16,11 @@ pub const TUN_F_USO6: libc::c_int = 0x40;
 /// `IFF_VNET_HDR` tap.
 pub const VNET_HDR_LEN: usize = 10;
 
+// virtio_net_hdr flag/gso constants (linux/virtio_net.h).
+pub const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
+pub const VIRTIO_NET_HDR_GSO_TCPV4: u8 = 1;
+pub const VIRTIO_NET_HDR_GSO_TCPV6: u8 = 4;
+
 /// Parsed `struct virtio_net_hdr`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct VnetHdr {

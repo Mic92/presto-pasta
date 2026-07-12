@@ -15,6 +15,12 @@ pub const IPPROTO_TCP: u8 = 6;
 pub const IPPROTO_UDP: u8 = 17;
 pub const IPPROTO_ICMPV6: u8 = 58;
 
+pub const TCP_HDR_LEN: usize = 20;
+pub const TCP_FIN: u8 = 0x01;
+pub const TCP_SYN: u8 = 0x02;
+pub const TCP_RST: u8 = 0x04;
+pub const TCP_ACK: u8 = 0x10;
+
 pub const ICMP_HDR_LEN: usize = 8;
 pub const ICMP_ECHO_REQUEST: u8 = 8;
 pub const ICMPV6_ECHO_REQUEST: u8 = 128;
@@ -162,6 +168,104 @@ impl IcmpEcho {
     }
 }
 
+/// TCP header view. Only the MSS and window-scale options are decoded;
+/// others are skipped.
+#[derive(Debug, Clone, Copy)]
+pub struct TcpHdr {
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub seq: u32,
+    pub ack: u32,
+    pub flags: u8,
+    pub window: u16,
+    pub header_len: usize,
+    pub mss: Option<u16>,
+    pub wscale: Option<u8>,
+}
+
+impl TcpHdr {
+    #[must_use]
+    pub fn parse(b: &[u8]) -> Option<Self> {
+        if b.len() < TCP_HDR_LEN {
+            return None;
+        }
+        let header_len = usize::from(b[12] >> 4) * 4;
+        if header_len < TCP_HDR_LEN || b.len() < header_len {
+            return None;
+        }
+        let mut hdr = Self {
+            src_port: u16::from_be_bytes([b[0], b[1]]),
+            dst_port: u16::from_be_bytes([b[2], b[3]]),
+            seq: u32::from_be_bytes([b[4], b[5], b[6], b[7]]),
+            ack: u32::from_be_bytes([b[8], b[9], b[10], b[11]]),
+            flags: b[13],
+            window: u16::from_be_bytes([b[14], b[15]]),
+            header_len,
+            mss: None,
+            wscale: None,
+        };
+        let mut opts = &b[TCP_HDR_LEN..header_len];
+        while let Some((&kind, rest)) = opts.split_first() {
+            match kind {
+                0 => break,
+                1 => {
+                    opts = rest;
+                    continue;
+                }
+                _ => {}
+            }
+            let (&len, _) = rest.split_first()?;
+            let (opt, rest) = opts.split_at_checked(usize::from(len).max(2))?;
+            match (kind, opt) {
+                (2, [_, _, hi, lo]) => hdr.mss = Some(u16::from_be_bytes([*hi, *lo])),
+                (3, [_, _, shift]) => hdr.wscale = Some(*shift),
+                _ => {}
+            }
+            opts = rest;
+        }
+        Some(hdr)
+    }
+
+    /// Write header (with `options`, whose length must be a multiple
+    /// of 4) and checksum into `out`, which must already hold the
+    /// payload after `TCP_HDR_LEN + options.len()` bytes. `pseudo` is
+    /// the pseudo-header sum; with `csum_offload` the checksum field
+    /// carries just the folded pseudo-header sum for the tap device to
+    /// complete.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the header fields")]
+    #[expect(clippy::cast_possible_truncation, reason = "folded to 16 bits")]
+    pub fn write(
+        out: &mut [u8],
+        ports: (u16, u16),
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        window: u16,
+        options: &[u8],
+        pseudo: u32,
+        csum_offload: bool,
+    ) {
+        let header_len = TCP_HDR_LEN + options.len();
+        debug_assert_eq!(options.len() % 4, 0);
+        out[0..2].copy_from_slice(&ports.0.to_be_bytes());
+        out[2..4].copy_from_slice(&ports.1.to_be_bytes());
+        out[4..8].copy_from_slice(&seq.to_be_bytes());
+        out[8..12].copy_from_slice(&ack.to_be_bytes());
+        out[12] = ((header_len / 4) as u8) << 4;
+        out[13] = flags;
+        out[14..16].copy_from_slice(&window.to_be_bytes());
+        out[16..20].fill(0);
+        out[TCP_HDR_LEN..header_len].copy_from_slice(options);
+        let csum = if csum_offload {
+            // Fold the pseudo-header sum without complementing it.
+            !checksum(&[], pseudo)
+        } else {
+            checksum(out, pseudo)
+        };
+        out[16..18].copy_from_slice(&csum.to_be_bytes());
+    }
+}
+
 /// UDP header view.
 #[derive(Debug, Clone, Copy)]
 pub struct UdpHdr {
@@ -295,6 +399,39 @@ mod tests {
         assert_eq!(h.proto, IPPROTO_UDP);
         assert_eq!(h.total_len, 120);
         assert_eq!(checksum(&b, 0), 0);
+    }
+
+    #[test]
+    fn tcp_roundtrip_with_options() {
+        let src = Ipv4Addr::new(10, 0, 0, 1);
+        let dst = Ipv4Addr::new(169, 254, 1, 2);
+        let options = [2, 4, 0xff, 0xd7, 1, 3, 3, 7]; // MSS 65495, wscale 7
+        let mut seg = vec![0u8; TCP_HDR_LEN + options.len() + 3];
+        seg[TCP_HDR_LEN + options.len()..].copy_from_slice(b"abc");
+        let len = u16::try_from(seg.len()).unwrap();
+        let pseudo = pseudo_v4(src, dst, IPPROTO_TCP, len);
+        TcpHdr::write(
+            &mut seg,
+            (443, 40000),
+            0x1234_5678,
+            0x9abc_def0,
+            TCP_SYN | TCP_ACK,
+            4096,
+            &options,
+            pseudo,
+            false,
+        );
+        assert_eq!(checksum(&seg, pseudo), 0);
+        let h = TcpHdr::parse(&seg).unwrap();
+        assert_eq!(h.src_port, 443);
+        assert_eq!(h.dst_port, 40000);
+        assert_eq!(h.seq, 0x1234_5678);
+        assert_eq!(h.ack, 0x9abc_def0);
+        assert_eq!(h.flags, TCP_SYN | TCP_ACK);
+        assert_eq!(h.window, 4096);
+        assert_eq!(h.header_len, TCP_HDR_LEN + options.len());
+        assert_eq!(h.mss, Some(65495));
+        assert_eq!(h.wscale, Some(7));
     }
 
     #[test]

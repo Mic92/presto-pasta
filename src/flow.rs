@@ -1,7 +1,8 @@
 //! Flow table: guest 5-tuple to host socket.
 
 use std::collections::HashMap;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::SocketAddr;
+use std::os::fd::OwnedFd;
 use std::time::Instant;
 
 use crate::buf;
@@ -18,22 +19,75 @@ pub struct FlowKey {
 }
 
 /// How replies from the host socket are framed back to the guest.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlowKind {
     Udp,
     /// ICMP/ICMPv6 echo over a ping socket; the kernel rewrites the
     /// echo identifier, so replies are patched back to the guest's.
     Ping,
+    Tcp,
 }
 
-/// A flow: connected host socket plus the buffer its pending recv
-/// targets.
+/// State of the FIN we send towards the guest when the host socket
+/// hits EOF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinState {
+    NotSent,
+    Sent,
+    Acked,
+}
+
+/// Connection state of a TCP flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpState {
+    /// `connect()` to the host target is in progress; SYN-ACK is sent
+    /// once the socket reports writability without error.
+    Connecting,
+    Established,
+}
+
+/// Per-flow TCP sequence bookkeeping.
+///
+/// Bytes sent to the guest are only peeked (`MSG_PEEK`) from the host
+/// socket and discarded once the guest acknowledges them, so
+/// retransmission needs no copies: rewinding `sent_unacked` re-peeks
+/// the same data.
+#[derive(Debug)]
+pub struct Tcp {
+    pub state: TcpState,
+    /// Sequence of the next byte expected from the guest.
+    pub seq_from_guest: u32,
+    /// Sequence of the oldest byte sent to the guest and not yet acked
+    /// (snapshots the guest's highest ack).
+    pub seq_una: u32,
+    /// Payload bytes past `seq_una` currently in flight to the guest.
+    pub sent_unacked: u32,
+    /// Guest receive window in bytes (already scaled).
+    pub guest_window: u32,
+    /// Window scale shift the guest offered, if any; scaling is only
+    /// in effect (in both directions) when this is `Some`.
+    pub guest_wscale: Option<u8>,
+    /// MSS the guest announced; used as GSO segment size towards it.
+    pub guest_mss: u16,
+    /// Host socket send buffer size, for clamping the window we
+    /// advertise to the guest.
+    pub sndbuf: u32,
+    pub host_fin: FinState,
+    pub guest_fin_received: bool,
+    /// A poll for readability of the host socket is pending.
+    pub poll_armed: bool,
+}
+
+/// A flow: connected host socket plus the buffer its pending recv or
+/// poll targets.
 pub struct Flow {
     pub key: FlowKey,
     pub kind: FlowKind,
-    pub sock: UdpSocket,
+    pub sock: OwnedFd,
     pub buf: buf::BufId,
     pub last_active: Instant,
+    /// TCP bookkeeping; `None` for UDP and ping flows.
+    pub tcp: Option<Tcp>,
     /// Set once expiry has cancelled the pending recv; the slot is
     /// freed when that recv completes.
     pub closing: bool,
@@ -110,9 +164,10 @@ mod tests {
                 dst: "10.0.0.1:53".parse().unwrap(),
             },
             kind: FlowKind::Udp,
-            sock: UdpSocket::bind("127.0.0.1:0").unwrap(),
+            sock: std::net::UdpSocket::bind("127.0.0.1:0").unwrap().into(),
             buf: 0,
             last_active: Instant::now(),
+            tcp: None,
             closing: false,
         }
     }

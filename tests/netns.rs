@@ -10,7 +10,8 @@
 //! as the reference for integrating presto into a sandbox runner.
 
 use std::io;
-use std::net::UdpSocket;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::process::{Command, exit};
 use std::time::Duration;
@@ -55,6 +56,41 @@ fn allow_ping_sockets() {
     std::fs::write("/proc/sys/net/ipv4/ping_group_range", "0 0").expect("enable ping sockets");
 }
 
+/// Bulk TCP echo through presto: connect, stream 1 MiB, read it back.
+fn tcp_echo(target: &str) {
+    let mut stream = None;
+    for _ in 0..20 {
+        if let Ok(s) = TcpStream::connect(target) {
+            stream = Some(s);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let mut stream = stream.unwrap_or_else(|| panic!("connect to {target}"));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    let payload: Vec<u8> = (0..1024u32 * 1024)
+        .map(|i| u8::try_from(i % 251).unwrap())
+        .collect();
+    let writer = {
+        let mut tx = stream.try_clone().expect("clone stream");
+        let payload = payload.clone();
+        std::thread::spawn(move || {
+            tx.write_all(&payload).expect("write payload");
+            tx.shutdown(std::net::Shutdown::Write).expect("shutdown");
+        })
+    };
+    let mut echoed = Vec::with_capacity(payload.len());
+    stream
+        .read_to_end(&mut echoed)
+        .unwrap_or_else(|e| panic!("read echo from {target}: {e}"));
+    writer.join().expect("writer thread");
+    assert_eq!(echoed.len(), payload.len(), "echo length from {target}");
+    assert_eq!(echoed, payload, "echo content from {target}");
+}
+
 /// Send one ICMP echo request over an unprivileged ping socket and wait
 /// for the reply.
 fn ping(dst: &str) -> bool {
@@ -96,7 +132,7 @@ fn reexec_unshared(role: &str, extra_env: &[(&str, String)]) -> Command {
     let mut cmd = Command::new("unshare");
     cmd.args(["--user", "--map-root-user", "--net", "--"])
         .arg(exe)
-        .args(["--exact", "udp_datapath"])
+        .args(["--exact", "datapath"])
         .env(ROLE, role);
     for (k, v) in extra_env {
         cmd.env(k, v);
@@ -162,6 +198,10 @@ fn sandbox() -> ! {
     for dst in ["10.0.0.1", "fd00::1"] {
         assert!(ping(dst), "no ICMP echo reply from {dst}");
     }
+
+    for target in ["10.0.0.1:7878", "[fd00::1]:7878"] {
+        tcp_echo(target);
+    }
     exit(0);
 }
 
@@ -178,6 +218,24 @@ fn host() -> ! {
             let mut b = [0u8; 2048];
             while let Ok((n, peer)) = echo.recv_from(&mut b) {
                 let _ = echo.send_to(&b[..n], peer);
+            }
+        });
+    }
+
+    for addr in ["10.0.0.1:7878", "[fd00::1]:7878"] {
+        let listener = TcpListener::bind(addr).expect("bind tcp echo");
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut rx = conn;
+                    let mut tx = rx.try_clone().expect("clone conn");
+                    let mut b = vec![0u8; 64 * 1024];
+                    while let Ok(n) = rx.read(&mut b) {
+                        if n == 0 || tx.write_all(&b[..n]).is_err() {
+                            break;
+                        }
+                    }
+                });
             }
         });
     }
@@ -216,7 +274,7 @@ fn host() -> ! {
 }
 
 #[test]
-fn udp_datapath() {
+fn datapath() {
     match std::env::var(ROLE).as_deref() {
         Ok("host") => host(),
         Ok("sandbox") => sandbox(),
