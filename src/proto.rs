@@ -332,9 +332,25 @@ pub fn pseudo_v6(src: Ipv6Addr, dst: Ipv6Addr, proto: u8, len: u16) -> u32 {
     sum
 }
 
-/// Unfolded 16-bit one's complement sum over `data`, for feeding a
-/// payload held in a separate buffer into `checksum` via its initial
-/// sum. Only used when checksum offload is unavailable.
+/// Unfolded 16-bit one's complement sum over a payload split across
+/// two slices (a ring buffer wrap), for feeding it into `checksum` via
+/// its initial sum. Only used when checksum offload is unavailable.
+#[must_use]
+pub fn sum2(a: &[u8], b: &[u8]) -> u32 {
+    let mut s2 = sum(b);
+    if a.len() % 2 == 1 {
+        // `b` starts at an odd offset within the payload; its folded
+        // sum contributes byte-swapped.
+        while s2 > 0xffff {
+            s2 = (s2 & 0xffff) + (s2 >> 16);
+        }
+        s2 = (s2 >> 8) | ((s2 & 0xff) << 8);
+    }
+    sum(a) + s2
+}
+
+/// Unfolded 16-bit one's complement sum over `data`; building block
+/// for `checksum` and `sum2`.
 #[must_use]
 pub fn sum(data: &[u8]) -> u32 {
     let mut sum = 0u32;
@@ -442,6 +458,19 @@ mod tests {
         assert_eq!(h.header_len, TCP_HDR_LEN + options.len());
         assert_eq!(h.mss, Some(65495));
         assert_eq!(h.wscale, Some(7));
+    }
+
+    #[test]
+    fn sum2_matches_contiguous_sum() {
+        let data: Vec<u8> = (0u16..300).map(|i| (i % 251) as u8).collect();
+        for split in [0, 1, 7, 128, 299, 300] {
+            let (a, b) = data.split_at(split);
+            assert_eq!(
+                checksum(&data, 0),
+                checksum(&[], sum2(a, b)),
+                "split {split}"
+            );
+        }
     }
 
     #[test]

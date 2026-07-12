@@ -70,6 +70,10 @@ pub struct Tcp {
     /// starting at `seq_una`; the first `sent_unacked` of them are in
     /// flight, the rest not yet sent.
     pub buffered: u32,
+    /// Ring position of the oldest buffered byte. The flow's buffer is
+    /// used as a ring so acks only advance this offset and no data is
+    /// ever moved.
+    pub buf_head: u32,
     /// The host closed its sending side; a FIN is forwarded to the
     /// guest once all buffered data has been sent and acknowledged.
     pub host_eof: bool,

@@ -20,6 +20,7 @@ pub fn apply() -> io::Result<()> {
         libc::SYS_write,
         libc::SYS_writev, // TCP segments to the tap: headers + payload
         libc::SYS_recvfrom,
+        libc::SYS_recvmsg, // scattered read into the TCP ring buffer at the wrap
         libc::SYS_sendto,
         // per-flow host sockets (DNS forwarding binds an ephemeral port)
         libc::SYS_socket,
