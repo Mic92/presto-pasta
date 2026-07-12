@@ -26,6 +26,7 @@ pub fn apply() -> io::Result<()> {
         libc::SYS_connect,
         libc::SYS_fcntl, // std sets O_NONBLOCK on new UDP sockets
         libc::SYS_getsockopt,
+        libc::SYS_setsockopt, // SO_SNDBUF on new TCP flows
         libc::SYS_shutdown,
         libc::SYS_ioctl, // SIOCOUTQ
         libc::SYS_close,

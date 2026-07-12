@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use io_uring::{IoUring, opcode, register::Restriction, squeue, types};
 use nix::sys::socket::{
     AddressFamily, MsgFlags, Shutdown, SockFlag, SockProtocol, SockType, SockaddrStorage, connect,
-    getsockopt, recv, send, shutdown, socket, sockopt,
+    getsockopt, recv, send, setsockopt, shutdown, socket, sockopt,
 };
 
 use crate::{Config, buf, dns, flow, proto, tap};
@@ -159,14 +159,18 @@ impl EventLoop {
     pub fn run(mut self) -> io::Result<()> {
         self.submit_tap_read()?;
         self.submit_timer()?;
+        // Drained CQEs are copied into a scratch vector (reused across
+        // iterations) so the borrow on the ring ends before handling.
+        let mut completions: Vec<(u64, i32)> = Vec::new();
         loop {
             self.ring.submit_and_wait(1)?;
-            let completions: Vec<(u64, i32)> = self
-                .ring
-                .completion()
-                .map(|cqe| (cqe.user_data(), cqe.result()))
-                .collect();
-            for (ud, res) in completions {
+            completions.clear();
+            completions.extend(
+                self.ring
+                    .completion()
+                    .map(|cqe| (cqe.user_data(), cqe.result())),
+            );
+            for &(ud, res) in &completions {
                 if ud == TAP_UD {
                     match res {
                         0 => return Ok(()), // tap torn down
@@ -557,6 +561,11 @@ impl EventLoop {
             SockProtocol::Tcp,
         )
         .ok()?;
+        // The window we advertise to the guest is the free space in the
+        // send buffer; the kernel default (~200 KiB, and fixed once we
+        // read it) caps upload throughput at window/loop-latency, so
+        // ask for a larger buffer up front.
+        let _ = setsockopt(&sock, sockopt::SndBuf, &(4 * 1024 * 1024));
         match connect(sock.as_raw_fd(), &SockaddrStorage::from(key.dst)) {
             Ok(()) | Err(nix::errno::Errno::EINPROGRESS) => {}
             Err(_) => return None, // no SYN-ACK; the guest times out
@@ -753,6 +762,12 @@ impl EventLoop {
             return;
         };
         if t.state != flow::TcpState::Established || t.host_fin != flow::FinState::NotSent {
+            return;
+        }
+        if t.poll_armed && t.sent_unacked == 0 {
+            // Nothing in flight to extend and the armed poll will
+            // report new host data; skip the (usually empty) peek that
+            // guest acks would otherwise trigger per segment.
             return;
         }
         let sent = t.sent_unacked as usize;

@@ -14,17 +14,24 @@ namespace whose only path out is the datapath under test (presto over
 its tap fd, pasta with `--config-net` and port forwarding disabled,
 matching how sandbox runners invoke it).
 
+## Profiling
+
+Attach perf to the process whose environment carries
+`PRESTO_ROLE=bench-host` (it hosts the presto thread) while the bench
+runs:
+
+```
+perf record -g --call-graph dwarf -p <pid> -- sleep 4
+perf report --stdio --no-children
+```
+
 ## Results
 
-AMD Ryzen 7 PRO 8840HS, Linux 6.18, 2026-07-12, commit `89a2e8a`
-(defaults: 64 buffers, single thread), 5 s per direction:
+AMD Ryzen 7 PRO 8840HS, Linux 6.18, 2026-07-12 (defaults: 64 buffers,
+single thread), 5 s per direction, three runs; the spread is
+run-to-run variance on a busy laptop, not a stable difference:
 
-| direction               | presto        | pasta         |
-| ----------------------- | ------------- | ------------- |
-| upload (guest → host)   | 7.1 Gbits/s   | 14.2 Gbits/s  |
-| download (host → guest) | 14.3 Gbits/s  | 16.8 Gbits/s  |
-
-Download is close to pasta. Upload trails because guest→host copies
-each GSO frame with a plain blocking `send()` per segment batch;
-`SEND_ZC`/batched submissions on the host socket side are still
-pending.
+| direction               | presto           | pasta            |
+| ----------------------- | ---------------- | ---------------- |
+| upload (guest → host)   | 15–31 Gbits/s    | 15–37 Gbits/s    |
+| download (host → guest) | 20–22 Gbits/s    | 12–23 Gbits/s    |
