@@ -59,8 +59,7 @@ nix::ioctl_read_bad!(siocoutq, libc::TIOCOUTQ, libc::c_int);
 /// disabled, so ops for handlers that are not implemented yet are
 /// already listed.
 const ALLOWED_OPS: &[u8] = &[
-    opcode::ReadFixed::CODE,
-    opcode::WriteFixed::CODE,
+    opcode::Read::CODE,
     opcode::Recv::CODE,
     opcode::RecvMulti::CODE,
     opcode::Send::CODE,
@@ -109,19 +108,6 @@ impl EventLoop {
         ring.submitter()
             .register_files(&[tap.fd().as_raw_fd()])
             .map_err(ctx("register_files"))?;
-        let region = pool.region();
-        let iov = libc::iovec {
-            iov_base: region.as_mut_ptr().cast(),
-            iov_len: region.len(),
-        };
-        // SAFETY: the pool outlives the ring; both live in EventLoop and
-        // the ring is dropped first (field order).
-        unsafe {
-            ring.submitter()
-                .register_buffers(&[iov])
-                .map_err(ctx("register_buffers"))?;
-        }
-
         let mut restrictions: Vec<Restriction> = ALLOWED_OPS
             .iter()
             .map(|&op| Restriction::sqe_op(op))
@@ -232,7 +218,7 @@ impl EventLoop {
     fn submit_tap_read(&mut self) -> io::Result<()> {
         let b = self.pool.get_mut(self.tap_buf);
         #[expect(clippy::cast_possible_truncation, reason = "buffer size fits u32")]
-        let read = opcode::ReadFixed::new(TAP, b.as_mut_ptr(), b.len() as u32, 0)
+        let read = opcode::Read::new(TAP, b.as_mut_ptr(), b.len() as u32)
             .build()
             .user_data(TAP_UD);
         self.push(&read)
@@ -835,16 +821,18 @@ impl EventLoop {
         if new == 0 {
             return; // everything readable is already in flight
         }
-        let send_len = new.min(budget).min(TCP_MAX_PAYLOAD);
         if new > budget {
             self.stats.budget_short();
         }
+        let send_len = new.min(budget);
         let window = self.tcp_window_to_guest(id);
         let use_gso = self.tap.offloads().tso() && send_len > usize::from(mss);
+        // Each frame written to the tap is capped by the 16-bit IP
+        // total length; larger send_len is split into several frames.
         let chunk = if use_gso {
-            send_len
+            send_len.min(TCP_MAX_PAYLOAD)
         } else {
-            send_len.min(usize::from(mss))
+            send_len.min(usize::from(mss)).min(TCP_MAX_PAYLOAD)
         };
         let mut off = 0;
         while off < send_len {

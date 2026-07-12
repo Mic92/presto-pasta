@@ -1,20 +1,24 @@
 //! Fixed pool of frame buffers.
 //!
-//! Each buffer holds one 64k super-frame plus headroom where L2/L3/L4
-//! headers are built in front of the payload, so payload never moves.
+//! Each buffer holds payload plus headroom where L2/L3/L4 headers are
+//! built in front of the payload, so payload never moves.
 
 /// Headroom in front of the payload for vnet + ethernet + IP + TCP headers.
 pub const HEADROOM: usize = 256;
-/// Maximum GSO super-frame size.
-pub const FRAME: usize = 65536;
+/// Payload space per buffer. It bounds a tap frame (up to a 64 KiB
+/// super-frame) and, per TCP flow, the data in flight towards the
+/// guest: retransmits are re-peeked from this buffer, so unacked data
+/// must fit. Well above twice the largest possible MSS, otherwise the
+/// guest's delayed ack (which waits for two full segments) would idle
+/// the flow at large MTUs.
+pub const FRAME: usize = 262_144;
 /// Total size of one buffer.
 pub const BUF_SIZE: usize = HEADROOM + FRAME;
 
 /// Index of a buffer in the pool.
 pub type BufId = u32;
 
-/// Fixed-size pool; buffers are contiguous so the whole region can be
-/// registered with `io_uring` once.
+/// Fixed-size pool of equally sized buffers.
 pub struct Pool {
     mem: Box<[u8]>,
     free: Vec<BufId>,
@@ -30,12 +34,6 @@ impl Pool {
             mem: vec![0u8; count * BUF_SIZE].into_boxed_slice(),
             free: (0..u32::try_from(count).expect("pool size fits u32")).collect(),
         }
-    }
-
-    /// Whole backing region, for `io_uring` buffer registration.
-    #[must_use]
-    pub fn region(&mut self) -> &mut [u8] {
-        &mut self.mem
     }
 
     pub fn alloc(&mut self) -> Option<BufId> {
