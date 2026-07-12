@@ -163,19 +163,8 @@ fn setup_and_pass_tap() -> OwnedFd {
     let tap_fd = open_tap("eth0").expect("open tap");
 
     ip("link set lo up");
-    // Same MTU pasta configures on its tap: with the default 1500 the
-    // guest's MSS is 1460 and its GSO frames stay well below the 64 KiB
-    // a frame could carry.
-    ip("link set eth0 mtu 65520");
-    ip("link set eth0 up");
-    ip("addr add 169.254.1.2/16 dev eth0");
-    ip("addr add 64:ff9b:1:4b8e:472e:a5c8:a9fe:102/112 dev eth0 nodad");
-    ip("route add default via 169.254.1.1 dev eth0");
-    ip("route add default via 64:ff9b:1:4b8e:472e:a5c8:a9fe:101 dev eth0");
-    ip("neigh add 169.254.1.1 lladdr 9a:55:9a:55:9a:55 dev eth0 nud permanent");
-    ip(
-        "neigh add 64:ff9b:1:4b8e:472e:a5c8:a9fe:101 lladdr 9a:55:9a:55:9a:55 dev eth0 nud permanent",
-    );
+    presto_pasta::netdev::configure("eth0", &presto_pasta::Config::default())
+        .expect("configure eth0");
 
     let pass_fd: RawFd = std::env::var(PASS_FD).unwrap().parse().unwrap();
     let pass = unsafe { BorrowedFd::borrow_raw(pass_fd) };
