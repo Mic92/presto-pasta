@@ -35,11 +35,13 @@
           version = "0.1.0";
           src = self;
           cargoLock.lockFile = ./Cargo.lock;
-          # The netns test needs ip and unshare; it skips itself where
-          # user namespaces are unavailable (e.g. a stricter sandbox).
-          nativeCheckInputs = with pkgs; [
-            iproute2
-            util-linux
+          # The netns integration tests need nested user namespaces and
+          # /dev/net/tun, which the Nix build sandbox does not provide;
+          # run them from the dev shell instead.
+          checkFlags = [
+            "--skip=datapath"
+            "--skip=flow_filter"
+            "--skip=lossy_download"
           ];
         };
 
