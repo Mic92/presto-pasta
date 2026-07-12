@@ -355,6 +355,54 @@ fn iperf3_client(label: &str) {
     }
 }
 
+/// Run the iperf3 UDP client against the host-side server, once in
+/// each direction. 1400-byte datagrams and no rate limit: each
+/// datagram is one frame through the datapath (plain UDP sockets get
+/// no GSO batching), so this measures per-packet cost.
+fn iperf3_udp_client(label: &str) {
+    let cpus = bench_cpus();
+    for (dir, extra) in [("upload", &[][..]), ("download", &["-R"][..])] {
+        println!("=== {label} udp {dir} ===");
+        let status = pinned(cpus.as_ref().map(|c| c[2].as_str()), "iperf3")
+            .args([
+                "-c", "10.0.0.1", "-u", "-b", "0", "-l", "1400", "-t", "5", "-f", "g",
+            ])
+            .args(extra)
+            .status()
+            .expect("run iperf3 udp client");
+        assert!(status.success(), "iperf3 udp {label} {dir} failed");
+    }
+}
+
+/// UDP bench sandbox namespace: configure the tap, then measure with
+/// iperf3 in UDP mode.
+fn udp_sandbox() -> ! {
+    let _tap_fd = setup_and_pass_tap();
+    iperf3_udp_client("presto");
+    exit(0);
+}
+
+/// UDP throughput comparison against pasta; needs iperf3 and pasta in
+/// PATH. Run with `cargo test --release -- --ignored --nocapture
+/// bench_udp`.
+#[test]
+#[ignore = "benchmark, run explicitly"]
+fn bench_udp() {
+    match std::env::var(ROLE).as_deref() {
+        Ok("udp-host") => iperf3_bench_host("udp-sandbox", "bench_udp", "udp-pasta"),
+        Ok("udp-sandbox") => udp_sandbox(),
+        Ok("udp-pasta") => {
+            iperf3_udp_client("pasta");
+            exit(0);
+        }
+        _ => {}
+    }
+    let status = reexec_unshared("udp-host", "bench_udp", &[])
+        .status()
+        .expect("unshare");
+    assert!(status.success(), "bench_udp run failed");
+}
+
 /// Bench sandbox namespace: configure the tap, then measure with iperf3.
 fn bench_sandbox() -> ! {
     let _tap_fd = setup_and_pass_tap();
@@ -400,9 +448,10 @@ fn client_via_pasta(test: &str, role: &str) -> bool {
         .success()
 }
 
-/// Bench host namespace: iperf3 server plus presto, then the same
-/// measurement through pasta attached to its own namespace.
-fn bench_host() -> ! {
+/// Bench host namespace shared by the TCP and UDP iperf3 benchmarks:
+/// iperf3 server plus presto, then the same measurement through pasta
+/// attached to its own namespace.
+fn iperf3_bench_host(sandbox_role: &str, test: &str, pasta_role: &str) -> ! {
     ip("link set lo up");
     ip("addr add 10.0.0.1/32 dev lo");
 
@@ -413,10 +462,10 @@ fn bench_host() -> ! {
         .spawn()
         .expect("start iperf3 server");
 
-    let mut child = spawn_sandbox_with_presto("bench-sandbox", "bench");
+    let mut child = spawn_sandbox_with_presto(sandbox_role, test);
     let presto_ok = child.wait().expect("wait bench sandbox").success();
 
-    let pasta_ok = client_via_pasta("bench", "bench-pasta");
+    let pasta_ok = client_via_pasta(test, pasta_role);
 
     let _ = server.kill();
     let _ = server.wait();
@@ -577,7 +626,7 @@ fn lossy_download() {
 #[ignore = "benchmark, run explicitly"]
 fn bench() {
     match std::env::var(ROLE).as_deref() {
-        Ok("bench-host") => bench_host(),
+        Ok("bench-host") => iperf3_bench_host("bench-sandbox", "bench", "bench-pasta"),
         Ok("bench-sandbox") => bench_sandbox(),
         Ok("bench-pasta") => {
             iperf3_client("pasta");
