@@ -63,7 +63,6 @@ pub struct EventLoop {
     tap: tap::Tap,
     cfg: Config,
     flows: flow::FlowTable,
-    resolver: Option<SocketAddr>,
     guest_mac: [u8; 6],
     tap_buf: buf::BufId,
     timer_ts: types::Timespec,
@@ -121,7 +120,6 @@ impl EventLoop {
             tap,
             cfg: cfg.clone(),
             flows: flow::FlowTable::default(),
-            resolver: dns::host_resolver(),
             guest_mac: [0; 6],
             tap_buf,
             timer_ts: types::Timespec::new().sec(TIMER_INTERVAL.as_secs()),
@@ -355,7 +353,8 @@ impl EventLoop {
 
     /// Create the connected host socket for a new guest flow and arm
     /// its first recv. DNS to the gateway is redirected to the host
-    /// resolver.
+    /// resolver, re-read from resolv.conf per flow so changes (e.g. by
+    /// a DHCP client on the host) are picked up without a reload.
     fn new_flow(&mut self, key: flow::FlowKey, kind: flow::FlowKind) -> Option<usize> {
         let sock = match kind {
             flow::FlowKind::Udp => {
@@ -363,7 +362,7 @@ impl EventLoop {
                     && (key.dst.ip() == IpAddr::V4(self.cfg.gateway4)
                         || key.dst.ip() == IpAddr::V6(self.cfg.gateway6));
                 let target = if gateway_dns && self.cfg.dns_forward {
-                    self.resolver?
+                    dns::host_resolver()?
                 } else {
                     key.dst
                 };
