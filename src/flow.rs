@@ -75,6 +75,9 @@ pub struct Tcp {
     pub host_eof: bool,
     /// Guest receive window in bytes (already scaled).
     pub guest_window: u32,
+    /// Consecutive duplicate acks from the guest; three trigger a
+    /// fast retransmit of everything in flight.
+    pub dup_acks: u8,
     /// Window scale shift the guest offered, if any; scaling is only
     /// in effect (in both directions) when this is `Some`.
     pub guest_wscale: Option<u8>,

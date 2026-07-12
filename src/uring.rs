@@ -584,6 +584,7 @@ impl EventLoop {
                 guest_wscale: syn.wscale.map(|s| s.min(14)),
                 guest_mss: syn.mss.unwrap_or(TCP_DEFAULT_MSS),
                 sndbuf,
+                dup_acks: 0,
                 buffered: 0,
                 host_eof: false,
                 host_fin: flow::FinState::NotSent,
@@ -677,39 +678,7 @@ impl EventLoop {
         }
         let mut ack_guest = false;
         if hdr.flags & proto::TCP_ACK != 0 {
-            t.guest_window = u32::from(hdr.window) << t.guest_wscale.unwrap_or(0);
-            self.stats.guest_window(t.guest_window);
-            let advance = hdr.ack.wrapping_sub(t.seq_una);
-            let max_advance = t.sent_unacked + u32::from(t.host_fin != flow::FinState::NotSent);
-            if advance > 0 && advance <= max_advance {
-                let data_acked = advance.min(t.sent_unacked);
-                t.sent_unacked -= data_acked;
-                t.seq_una = t.seq_una.wrapping_add(data_acked);
-                if advance > data_acked {
-                    t.host_fin = flow::FinState::Acked;
-                }
-                if data_acked > 0 {
-                    // Drop the acked prefix from the flow's buffer and
-                    // move what is still unacknowledged to the front.
-                    t.buffered -= data_acked;
-                    let remaining = t.buffered as usize;
-                    if remaining > 0 {
-                        let start = buf::HEADROOM + data_acked as usize;
-                        self.pool
-                            .get_mut(flow_buf)
-                            .copy_within(start..start + remaining, buf::HEADROOM);
-                    }
-                }
-            } else if advance == 0
-                && payload.is_empty()
-                && hdr.flags & proto::TCP_FIN == 0
-                && t.sent_unacked > 0
-            {
-                // Duplicate ack: retransmit everything in flight by
-                // resending it from the flow's buffer.
-                t.sent_unacked = 0;
-                self.stats.dup_ack_retransmit();
-            }
+            self.tcp_ack_from_guest(id, hdr, flow_buf, payload.is_empty());
         }
         // Guest payload into the host socket. Only in-order data is
         // accepted; anything else is dropped and the resulting
@@ -769,6 +738,65 @@ impl EventLoop {
 
     fn tcp_state(&self, id: usize) -> Option<&flow::Tcp> {
         self.flows.get_by_id(id)?.tcp.as_ref()
+    }
+
+    /// Handle the ack and window fields of a guest segment: release
+    /// acknowledged data from the flow's buffer and detect duplicate
+    /// acks for fast retransmit.
+    fn tcp_ack_from_guest(
+        &mut self,
+        id: usize,
+        hdr: &proto::TcpHdr,
+        flow_buf: buf::BufId,
+        payload_empty: bool,
+    ) {
+        let Some(t) = self.flows.get_mut(id).and_then(|f| f.tcp.as_mut()) else {
+            return;
+        };
+        let old_window = t.guest_window;
+        t.guest_window = u32::from(hdr.window) << t.guest_wscale.unwrap_or(0);
+        self.stats.guest_window(t.guest_window);
+        let advance = hdr.ack.wrapping_sub(t.seq_una);
+        let max_advance = t.sent_unacked + u32::from(t.host_fin != flow::FinState::NotSent);
+        if advance > 0 && advance <= max_advance {
+            let data_acked = advance.min(t.sent_unacked);
+            t.dup_acks = 0;
+            t.sent_unacked -= data_acked;
+            t.seq_una = t.seq_una.wrapping_add(data_acked);
+            if advance > data_acked {
+                t.host_fin = flow::FinState::Acked;
+            }
+            if data_acked > 0 {
+                // Drop the acked prefix from the flow's buffer and
+                // move what is still unacknowledged to the front.
+                t.buffered -= data_acked;
+                let remaining = t.buffered as usize;
+                if remaining > 0 {
+                    let start = buf::HEADROOM + data_acked as usize;
+                    self.pool
+                        .get_mut(flow_buf)
+                        .copy_within(start..start + remaining, buf::HEADROOM);
+                }
+            }
+        } else if advance == 0
+            && payload_empty
+            && hdr.flags & proto::TCP_FIN == 0
+            && t.sent_unacked > 0
+            && t.guest_window == old_window
+        {
+            // Duplicate ack (same ack, no data, no window change).
+            // Pure window updates must not count, otherwise every
+            // guest window advertisement during a bulk download
+            // would trigger a retransmit.
+            t.dup_acks = t.dup_acks.saturating_add(1);
+            if t.dup_acks >= 3 {
+                // Fast retransmit: resend everything in flight
+                // from the flow's buffer.
+                t.dup_acks = 0;
+                t.sent_unacked = 0;
+                self.stats.dup_ack_retransmit();
+            }
+        }
     }
 
     /// Read data waiting on the host socket into the flow's buffer and
