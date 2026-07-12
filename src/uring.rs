@@ -90,6 +90,7 @@ pub struct EventLoop {
     flows: flow::FlowTable,
     guest_mac: [u8; 6],
     tap_buf: buf::BufId,
+    stats: crate::stats::Stats,
     timer_ts: types::Timespec,
 }
 
@@ -147,6 +148,7 @@ impl EventLoop {
             flows: flow::FlowTable::default(),
             guest_mac: [0; 6],
             tap_buf,
+            stats: crate::stats::Stats::new(),
             timer_ts: types::Timespec::new().sec(TIMER_INTERVAL.as_secs()),
         })
     }
@@ -170,6 +172,7 @@ impl EventLoop {
                     .completion()
                     .map(|cqe| (cqe.user_data(), cqe.result())),
             );
+            self.stats.wakeup(completions.len());
             for &(ud, res) in &completions {
                 if ud == TAP_UD {
                     match res {
@@ -256,6 +259,8 @@ impl EventLoop {
     /// and buffer are only freed once the cancelled operation
     /// completes, so in-flight completions never hit a reused slot.
     fn remove_flow(&mut self, id: usize) {
+        // Flow teardown is a natural checkpoint for the counters.
+        self.stats.dump();
         let pending = self
             .flows
             .get_by_id(id)
@@ -329,6 +334,7 @@ impl EventLoop {
     }
 
     fn handle_tap_frame(&mut self, len: usize) {
+        self.stats.tap_in(len);
         let Some(g) = self.parse_frame(len) else {
             return;
         };
@@ -524,6 +530,7 @@ impl EventLoop {
         .write(&mut b[eth_start..]);
         b[vnet_start..eth_start].fill(0);
 
+        self.stats.tap_out(end - vnet_start);
         let _ = nix::unistd::write(self.tap.fd(), &b[vnet_start..end]);
     }
 
@@ -714,6 +721,7 @@ impl EventLoop {
                 let data = &self.pool.get(self.tap_buf)[payload.clone()];
                 accepted =
                     send(raw, data, MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL).unwrap_or(0);
+                self.stats.sock_send(accepted, payload.len());
                 if let Some(t) = self.flows.get_mut(id).and_then(|f| f.tcp.as_mut()) {
                     #[expect(clippy::cast_possible_truncation, reason = "frame fits u32")]
                     {
@@ -728,6 +736,7 @@ impl EventLoop {
             if let Some(t) = self.flows.get_mut(id).and_then(|f| f.tcp.as_mut()) {
                 if accepted == payload.len() && hdr.flags & proto::TCP_PSH == 0 && !t.ack_deferred {
                     t.ack_deferred = true;
+                    self.stats.ack_deferred();
                 } else {
                     ack_guest = true;
                 }
@@ -797,6 +806,7 @@ impl EventLoop {
         let b = &mut self.pool.get_mut(buf_id)[buf::HEADROOM..buf::HEADROOM + max_peek];
         let n = match recv(raw, b, MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT) {
             Err(nix::errno::Errno::EAGAIN) => {
+                self.stats.peek(true);
                 if !poll_armed {
                     let _ = self.arm_poll(id, POLL_RECV);
                 }
@@ -817,6 +827,7 @@ impl EventLoop {
             }
             Ok(n) => n,
         };
+        self.stats.peek(false);
         let new = n.saturating_sub(sent);
         if new == 0 {
             return; // everything readable is already in flight
@@ -915,6 +926,7 @@ impl EventLoop {
     /// Send a payload-less segment (ACK, FIN, RST) at the current
     /// send position.
     fn send_tcp_control(&mut self, id: usize, flags: u8) {
+        self.stats.tcp_ctrl();
         let window = if flags & proto::TCP_RST != 0 {
             0
         } else {
@@ -1026,6 +1038,7 @@ impl EventLoop {
         };
         b[vnet_start..eth_start].copy_from_slice(&vnet.to_bytes());
 
+        self.stats.tap_out(end - vnet_start);
         let _ = nix::unistd::write(self.tap.fd(), &b[vnet_start..end]);
     }
 }

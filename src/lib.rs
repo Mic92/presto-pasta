@@ -16,6 +16,7 @@ pub mod flow;
 pub mod proto;
 #[cfg(feature = "seccomp")]
 mod seccomp;
+mod stats;
 pub mod tap;
 pub mod uring;
 
