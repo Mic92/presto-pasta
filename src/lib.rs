@@ -54,6 +54,9 @@ impl Default for Config {
 pub struct Presto {
     cfg: Config,
     tap: tap::Tap,
+    /// Write ends of liveness pipes; dropped (closing the read ends'
+    /// peers) when the event loop exits.
+    liveness: Vec<OwnedFd>,
 }
 
 impl Presto {
@@ -65,7 +68,22 @@ impl Presto {
         Self {
             cfg,
             tap: tap::Tap::new(tap_fd),
+            liveness: Vec::new(),
         }
+    }
+
+    /// A liveness fd for a supervisor: it signals `POLLHUP`/EOF when
+    /// the event loop exits (or the datapath process dies), so the
+    /// supervisor can fail the sandboxed job instead of letting it
+    /// hang without network.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pipe cannot be created.
+    pub fn liveness_fd(&mut self) -> io::Result<OwnedFd> {
+        let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
+        self.liveness.push(write);
+        Ok(read)
     }
 
     /// Run the event loop until the tap fd is torn down or an
