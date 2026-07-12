@@ -584,6 +584,8 @@ impl EventLoop {
                 guest_wscale: syn.wscale.map(|s| s.min(14)),
                 guest_mss: syn.mss.unwrap_or(TCP_DEFAULT_MSS),
                 sndbuf,
+                buffered: 0,
+                host_eof: false,
                 host_fin: flow::FinState::NotSent,
                 guest_fin_received: false,
                 ack_deferred: false,
@@ -653,6 +655,7 @@ impl EventLoop {
         };
         f.last_active = Instant::now();
         let raw = f.sock.as_raw_fd();
+        let flow_buf = f.buf;
         let Some(t) = f.tcp.as_mut() else {
             return;
         };
@@ -686,7 +689,16 @@ impl EventLoop {
                     t.host_fin = flow::FinState::Acked;
                 }
                 if data_acked > 0 {
-                    discard_acked(raw, data_acked);
+                    // Drop the acked prefix from the flow's buffer and
+                    // move what is still unacknowledged to the front.
+                    t.buffered -= data_acked;
+                    let remaining = t.buffered as usize;
+                    if remaining > 0 {
+                        let start = buf::HEADROOM + data_acked as usize;
+                        self.pool
+                            .get_mut(flow_buf)
+                            .copy_within(start..start + remaining, buf::HEADROOM);
+                    }
                 }
             } else if advance == 0
                 && payload.is_empty()
@@ -694,7 +706,7 @@ impl EventLoop {
                 && t.sent_unacked > 0
             {
                 // Duplicate ack: retransmit everything in flight by
-                // re-peeking it from the socket.
+                // resending it from the flow's buffer.
                 t.sent_unacked = 0;
                 self.stats.dup_ack_retransmit();
             }
@@ -759,10 +771,11 @@ impl EventLoop {
         self.flows.get_by_id(id)?.tcp.as_ref()
     }
 
-    /// Peek data waiting on the host socket and send whatever fits in
-    /// the guest's window as one GSO super-frame (or MSS-sized
-    /// segments without TSO). Data is only discarded from the socket
-    /// once the guest acks it, so retransmission just re-peeks.
+    /// Read data waiting on the host socket into the flow's buffer and
+    /// send whatever fits in the guest's window as GSO super-frames
+    /// (or MSS-sized segments without TSO). Buffered data is dropped
+    /// only once the guest acks it, so retransmission resends from the
+    /// buffer without touching the socket.
     fn tcp_data_to_guest(&mut self, id: usize) {
         let Some(f) = self.flows.get_by_id(id) else {
             return;
@@ -775,13 +788,15 @@ impl EventLoop {
         if t.state != flow::TcpState::Established || t.host_fin != flow::FinState::NotSent {
             return;
         }
-        if t.poll_armed && t.sent_unacked == 0 {
-            // Nothing in flight to extend and the armed poll will
-            // report new host data; skip the (usually empty) peek that
+        let sent = t.sent_unacked as usize;
+        let buffered = t.buffered as usize;
+        let host_eof = t.host_eof;
+        if t.poll_armed && buffered == sent && !host_eof {
+            // Nothing unsent is buffered and the armed poll will
+            // report new host data; skip the (usually empty) read that
             // guest acks would otherwise trigger per segment.
             return;
         }
-        let sent = t.sent_unacked as usize;
         let budget = t.guest_window.saturating_sub(t.sent_unacked) as usize;
         let mss = t.guest_mss;
         let seq = t.seq_una.wrapping_add(t.sent_unacked);
@@ -791,35 +806,24 @@ impl EventLoop {
             self.stats.window_full();
             return; // window full; the next guest ack retriggers
         }
-        let max_peek = buf::FRAME.min(sent + budget);
-        let b = &mut self.pool.get_mut(buf_id)[buf::HEADROOM..buf::HEADROOM + max_peek];
-        let n = match recv(raw, b, MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT) {
-            Err(nix::errno::Errno::EAGAIN) => {
-                self.stats.peek(true);
-                if !poll_armed {
-                    let _ = self.arm_poll(id, POLL_RECV);
-                }
-                return;
-            }
-            Err(_) => {
-                self.tcp_reset(id);
-                return;
-            }
-            Ok(0) => {
-                // Host closed its sending side; unacked data can no
-                // longer sit in the receive queue, so sent == 0 here.
+        let Some((buffered, host_eof, drained)) =
+            self.tcp_fill_buffer(id, raw, buf_id, buffered, host_eof)
+        else {
+            return; // flow was reset
+        };
+        let new = buffered - sent;
+        if new == 0 {
+            if host_eof && sent == 0 {
+                // Everything the host sent has been forwarded and
+                // acknowledged; forward its FIN.
                 self.send_tcp_control(id, proto::TCP_FIN | proto::TCP_ACK);
                 if let Some(t) = self.flows.get_mut(id).and_then(|f| f.tcp.as_mut()) {
                     t.host_fin = flow::FinState::Sent;
                 }
-                return;
+            } else if drained && !poll_armed {
+                let _ = self.arm_poll(id, POLL_RECV);
             }
-            Ok(n) => n,
-        };
-        self.stats.peek(false);
-        let new = n.saturating_sub(sent);
-        if new == 0 {
-            return; // everything readable is already in flight
+            return;
         }
         if new > budget {
             self.stats.budget_short();
@@ -859,11 +863,56 @@ impl EventLoop {
                 t.sent_unacked += send_len as u32;
             }
         }
-        // Only re-arm when the socket was drained; otherwise the next
-        // guest ack opens the window and sends the rest.
-        if send_len == new && !poll_armed {
+        // Only re-arm when the socket was drained; otherwise guest
+        // acks free buffer space and pull in the rest as they arrive.
+        if drained && send_len == new && !poll_armed {
             let _ = self.arm_poll(id, POLL_RECV);
         }
+    }
+
+    /// Top up the flow's buffer with data read from the host socket.
+    /// Returns the buffered length, whether the host closed its
+    /// sending side and whether the socket was drained; `None` when a
+    /// read error reset the flow.
+    fn tcp_fill_buffer(
+        &mut self,
+        id: usize,
+        raw: RawFd,
+        buf_id: buf::BufId,
+        mut buffered: usize,
+        mut host_eof: bool,
+    ) -> Option<(usize, bool, bool)> {
+        if host_eof || buffered >= buf::FRAME {
+            return Some((buffered, host_eof, false));
+        }
+        let mut drained = false;
+        let b =
+            &mut self.pool.get_mut(buf_id)[buf::HEADROOM + buffered..buf::HEADROOM + buf::FRAME];
+        let room = b.len();
+        match recv(raw, b, MsgFlags::MSG_DONTWAIT) {
+            Err(nix::errno::Errno::EAGAIN) => {
+                self.stats.sock_recv(true);
+                drained = true;
+            }
+            Err(_) => {
+                self.tcp_reset(id);
+                return None;
+            }
+            Ok(0) => host_eof = true,
+            Ok(n) => {
+                self.stats.sock_recv(false);
+                buffered += n;
+                drained = n < room;
+            }
+        }
+        if let Some(t) = self.flows.get_mut(id).and_then(|f| f.tcp.as_mut()) {
+            #[expect(clippy::cast_possible_truncation, reason = "buffer fits u32")]
+            {
+                t.buffered = buffered as u32;
+            }
+            t.host_eof = host_eof;
+        }
+        Some((buffered, host_eof, drained))
     }
 
     /// Window to advertise to the guest: free space in the host
@@ -957,8 +1006,9 @@ impl EventLoop {
         }
     }
 
-    /// Frame one TCP segment in the flow's buffer (headers built right
-    /// in front of the payload) and write it to the tap.
+    /// Frame one TCP segment: headers are built in a small scratch
+    /// buffer and written to the tap together with the payload, which
+    /// stays untouched in the flow's buffer so it can be retransmitted.
     fn send_tcp_segment(&mut self, id: usize, seg: &TcpSegment) {
         let Some(f) = self.flows.get_by_id(id) else {
             return;
@@ -969,30 +1019,36 @@ impl EventLoop {
         let gateway_mac = self.cfg.gateway_mac;
         let (guest4, guest6) = (self.cfg.guest4, self.cfg.guest6);
         let csum_offload = self.tap.offloads().csum();
+        let payload = &self.pool.get(buf_id)[seg.payload.clone()];
 
-        let l4_start = seg.payload.start - proto::TCP_HDR_LEN - seg.options.len();
-        let end = seg.payload.end;
-        let l4_len = u16::try_from(end - l4_start).unwrap_or(u16::MAX);
-        let (ip_start, ethertype, pseudo, gso_type) = match key.dst.ip() {
+        let eth_start = tap::VNET_HDR_LEN;
+        let ip_start = eth_start + proto::ETH_LEN;
+        let tcp_hdr_len = proto::TCP_HDR_LEN + seg.options.len();
+        let l4_len = u16::try_from(tcp_hdr_len + payload.len()).unwrap_or(u16::MAX);
+        let (l4_start, ethertype, mut pseudo, gso_type) = match key.dst.ip() {
             IpAddr::V4(src) => (
-                l4_start - proto::IPV4_HDR_LEN,
+                ip_start + proto::IPV4_HDR_LEN,
                 proto::ETHERTYPE_IPV4,
                 proto::pseudo_v4(src, guest4, proto::IPPROTO_TCP, l4_len),
                 tap::VIRTIO_NET_HDR_GSO_TCPV4,
             ),
             IpAddr::V6(src) => (
-                l4_start - proto::IPV6_HDR_LEN,
+                ip_start + proto::IPV6_HDR_LEN,
                 proto::ETHERTYPE_IPV6,
                 proto::pseudo_v6(src, guest6, proto::IPPROTO_TCP, l4_len),
                 tap::VIRTIO_NET_HDR_GSO_TCPV6,
             ),
         };
-        let eth_start = ip_start - proto::ETH_LEN;
-        let vnet_start = eth_start - tap::VNET_HDR_LEN;
+        if !csum_offload {
+            // The payload is not part of the header slice handed to
+            // `TcpHdr::write`, so fold its sum in via the pseudo sum.
+            pseudo += proto::sum(payload);
+        }
+        let hdr_end = l4_start + tcp_hdr_len;
+        let mut hdr = [0u8; buf::HEADROOM];
 
-        let b = self.pool.get_mut(buf_id);
         proto::TcpHdr::write(
-            &mut b[l4_start..end],
+            &mut hdr[l4_start..hdr_end],
             (key.dst.port(), key.guest_port),
             seg.seq,
             seg.ack,
@@ -1004,10 +1060,22 @@ impl EventLoop {
         );
         match key.dst.ip() {
             IpAddr::V4(src) => {
-                proto::Ipv4Hdr::write(&mut b[ip_start..], src, guest4, proto::IPPROTO_TCP, l4_len);
+                proto::Ipv4Hdr::write(
+                    &mut hdr[ip_start..],
+                    src,
+                    guest4,
+                    proto::IPPROTO_TCP,
+                    l4_len,
+                );
             }
             IpAddr::V6(src) => {
-                proto::Ipv6Hdr::write(&mut b[ip_start..], src, guest6, proto::IPPROTO_TCP, l4_len);
+                proto::Ipv6Hdr::write(
+                    &mut hdr[ip_start..],
+                    src,
+                    guest6,
+                    proto::IPPROTO_TCP,
+                    l4_len,
+                );
             }
         }
         proto::EthHdr {
@@ -1015,9 +1083,8 @@ impl EventLoop {
             src: gateway_mac,
             ethertype,
         }
-        .write(&mut b[eth_start..]);
+        .write(&mut hdr[eth_start..]);
 
-        let l2_hdr_len = seg.payload.start - eth_start;
         let vnet = tap::VnetHdr {
             flags: if csum_offload {
                 tap::VIRTIO_NET_HDR_F_NEEDS_CSUM
@@ -1025,15 +1092,16 @@ impl EventLoop {
                 0
             },
             gso_type: if seg.gso_size.is_some() { gso_type } else { 0 },
-            hdr_len: u16::try_from(l2_hdr_len).unwrap_or(0),
+            hdr_len: u16::try_from(hdr_end - eth_start).unwrap_or(0),
             gso_size: seg.gso_size.unwrap_or(0),
             csum_start: u16::try_from(l4_start - eth_start).unwrap_or(0),
             csum_offset: 16, // TCP checksum field offset
         };
-        b[vnet_start..eth_start].copy_from_slice(&vnet.to_bytes());
+        hdr[..eth_start].copy_from_slice(&vnet.to_bytes());
 
-        self.stats.tap_out(end - vnet_start);
-        let _ = nix::unistd::write(self.tap.fd(), &b[vnet_start..end]);
+        self.stats.tap_out(hdr_end + payload.len());
+        let iov = [io::IoSlice::new(&hdr[..hdr_end]), io::IoSlice::new(payload)];
+        let _ = nix::sys::uio::writev(self.tap.fd(), &iov);
     }
 }
 
@@ -1047,28 +1115,6 @@ struct TcpSegment<'a> {
     options: &'a [u8],
     payload: std::ops::Range<usize>,
     gso_size: Option<u16>,
-}
-
-/// Discard `n` bytes the guest acknowledged from the host socket's
-/// receive queue without copying them.
-fn discard_acked(raw: RawFd, n: u32) {
-    let mut left = n as usize;
-    while left > 0 {
-        // SAFETY: MSG_TRUNC on TCP discards without writing to the
-        // (null) buffer.
-        let r = unsafe {
-            libc::recv(
-                raw,
-                std::ptr::null_mut(),
-                left,
-                libc::MSG_TRUNC | libc::MSG_DONTWAIT,
-            )
-        };
-        if r <= 0 {
-            break;
-        }
-        left -= r.unsigned_abs().min(left);
-    }
 }
 
 /// Unprivileged ICMP echo ("ping") socket for the given address family.

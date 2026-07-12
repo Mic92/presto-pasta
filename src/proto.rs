@@ -228,10 +228,10 @@ impl TcpHdr {
     }
 
     /// Write header (with `options`, whose length must be a multiple
-    /// of 4) and checksum into `out`, which must already hold the
-    /// payload after `TCP_HDR_LEN + options.len()` bytes. `pseudo` is
-    /// the pseudo-header sum; with `csum_offload` the checksum field
-    /// carries just the folded pseudo-header sum for the tap device to
+    /// of 4) and checksum into `out`. `pseudo` is the pseudo-header
+    /// sum, plus the payload's `sum` when the payload lives in a
+    /// separate buffer; with `csum_offload` the checksum field carries
+    /// just the folded pseudo-header sum for the tap device to
     /// complete.
     #[expect(clippy::too_many_arguments, reason = "mirrors the header fields")]
     #[expect(clippy::cast_possible_truncation, reason = "folded to 16 bits")]
@@ -332,11 +332,12 @@ pub fn pseudo_v6(src: Ipv6Addr, dst: Ipv6Addr, proto: u8, len: u16) -> u32 {
     sum
 }
 
-/// RFC 1071 internet checksum over `data` with an initial sum (for
-/// pseudo-headers). Only used when checksum offload is unavailable.
+/// Unfolded 16-bit one's complement sum over `data`, for feeding a
+/// payload held in a separate buffer into `checksum` via its initial
+/// sum. Only used when checksum offload is unavailable.
 #[must_use]
-pub fn checksum(data: &[u8], init: u32) -> u16 {
-    let mut sum = init;
+pub fn sum(data: &[u8]) -> u32 {
+    let mut sum = 0u32;
     let (pairs, rest) = data.as_chunks::<2>();
     for c in pairs {
         sum += u32::from(u16::from_be_bytes(*c));
@@ -344,6 +345,14 @@ pub fn checksum(data: &[u8], init: u32) -> u16 {
     if let [last] = rest {
         sum += u32::from(u16::from_be_bytes([*last, 0]));
     }
+    sum
+}
+
+/// RFC 1071 internet checksum over `data` with an initial sum (for
+/// pseudo-headers). Only used when checksum offload is unavailable.
+#[must_use]
+pub fn checksum(data: &[u8], init: u32) -> u16 {
+    let mut sum = init + sum(data);
     while sum > 0xffff {
         sum = (sum & 0xffff) + (sum >> 16);
     }

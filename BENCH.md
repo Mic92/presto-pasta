@@ -46,5 +46,5 @@ direction, median of 5 runs:
 
 | direction               | presto        | pasta         |
 | ----------------------- | ------------- | ------------- |
-| upload (guest → host)   | 25.3 Gbits/s  | 28.0 Gbits/s  |
-| download (host → guest) | 11.2 Gbits/s  | 17.2 Gbits/s  |
+| upload (guest → host)   | 30.4 Gbits/s  | 29.4 Gbits/s  |
+| download (host → guest) | 21.3 Gbits/s  | 9–17 Gbits/s  |

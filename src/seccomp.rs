@@ -18,6 +18,7 @@ pub fn apply() -> io::Result<()> {
         libc::SYS_io_uring_enter,
         libc::SYS_read,
         libc::SYS_write,
+        libc::SYS_writev, // TCP segments to the tap: headers + payload
         libc::SYS_recvfrom,
         libc::SYS_sendto,
         // per-flow host sockets (DNS forwarding binds an ephemeral port)

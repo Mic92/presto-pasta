@@ -7,7 +7,7 @@
 pub const HEADROOM: usize = 256;
 /// Payload space per buffer. It bounds a tap frame (up to a 64 KiB
 /// super-frame) and, per TCP flow, the data in flight towards the
-/// guest: retransmits are re-peeked from this buffer, so unacked data
+/// guest: retransmits are resent from this buffer, so unacked data
 /// must fit. Well above twice the largest possible MSS, otherwise the
 /// guest's delayed ack (which waits for two full segments) would idle
 /// the flow at large MTUs.

@@ -48,11 +48,15 @@ pub enum TcpState {
 
 /// Per-flow TCP sequence bookkeeping.
 ///
-/// Bytes sent to the guest are only peeked (`MSG_PEEK`) from the host
-/// socket and discarded once the guest acknowledges them, so
-/// retransmission needs no copies: rewinding `sent_unacked` re-peeks
-/// the same data.
+/// Bytes towards the guest are read from the host socket into the
+/// flow's buffer and dropped from it only once the guest acknowledges
+/// them, so retransmission just rewinds `sent_unacked` and resends
+/// from the buffer.
 #[derive(Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent protocol conditions, not a state machine"
+)]
 pub struct Tcp {
     pub state: TcpState,
     /// Sequence of the next byte expected from the guest.
@@ -62,6 +66,13 @@ pub struct Tcp {
     pub seq_una: u32,
     /// Payload bytes past `seq_una` currently in flight to the guest.
     pub sent_unacked: u32,
+    /// Bytes read from the host socket and held in the flow's buffer,
+    /// starting at `seq_una`; the first `sent_unacked` of them are in
+    /// flight, the rest not yet sent.
+    pub buffered: u32,
+    /// The host closed its sending side; a FIN is forwarded to the
+    /// guest once all buffered data has been sent and acknowledged.
+    pub host_eof: bool,
     /// Guest receive window in bytes (already scaled).
     pub guest_window: u32,
     /// Window scale shift the guest offered, if any; scaling is only
