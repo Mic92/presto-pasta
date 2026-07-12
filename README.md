@@ -42,7 +42,7 @@ lifetime of the job. presto-pasta avoids that:
   privilege management, no CLI. An optional seccomp filter and an
   io_uring op allowlist confine the datapath thread.
 
-## What the caller does
+## Usage
 
 Add the crate:
 
