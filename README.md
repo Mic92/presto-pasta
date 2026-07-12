@@ -75,7 +75,9 @@ the namespace and tap setup.
 ## Scope
 
 Outbound TCP, UDP and ICMP/ICMPv6 echo with per-flow connected host
-sockets, plus DNS forwarding to the host resolver. Inbound port
+sockets, plus DNS forwarding to the host resolver. NAT64 carries the
+guest's IPv4 traffic on IPv6-only hosts (`Config::nat64_prefix`, with
+DNS64 prefix discovery). Inbound port
 forwarding, DHCP/RA, ARP/NDP responders and pasta's other modes are
 out of scope. Architecture: [DESIGN.md](DESIGN.md).
 

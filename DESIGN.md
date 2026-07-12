@@ -49,6 +49,10 @@ a built-in seccomp filter is an optional feature.
 - DNS forwarding: queries to the gateway address go to the host
   resolver; resolv.conf re-read on change; loopback resolvers
   (127.0.0.53) work because presto-pasta's sockets are in the host netns
+- NAT64 for IPv6-only hosts: guest IPv4 destinations are embedded into
+  the configured /96 prefix (RFC 6052) and the host sockets use IPv6;
+  the guest keeps speaking IPv4. The prefix can be discovered via DNS64
+  (RFC 7050)
 - liveness event fd on the handle so a supervisor can fail the job when
   the event loop exits
 
@@ -60,5 +64,6 @@ pcap.
 
 See the usage snippet in the [README](README.md). `Config`:
 gateway/guest addresses (to synthesize headers and recognize DNS
-traffic), DNS forwarding, buffer pool size. Defaults use link-local v4
-and a fixed ULA-style v6 scheme suitable for build sandboxes.
+traffic), DNS forwarding, NAT64 prefix, buffer pool size. Defaults use
+link-local v4 and a fixed ULA-style v6 scheme suitable for build
+sandboxes.
