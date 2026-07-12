@@ -74,6 +74,9 @@ pub struct Tcp {
     /// used as a ring so acks only advance this offset and no data is
     /// ever moved.
     pub buf_head: u32,
+    /// When data towards the guest was last sent or acknowledged; the
+    /// retransmission timeout resends in-flight data if this stalls.
+    pub last_progress: Instant,
     /// The host closed its sending side; a FIN is forwarded to the
     /// guest once all buffered data has been sent and acknowledged.
     pub host_eof: bool,
@@ -168,6 +171,24 @@ impl FlowTable {
             .enumerate()
             .filter_map(|(id, slot)| slot.as_ref().map(|f| (id, f)))
             .filter(|(_, f)| !f.closing && f.last_active < cutoff)
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// Ids of TCP flows with data in flight to the guest whose acks
+    /// have not progressed since before `cutoff`.
+    #[must_use]
+    pub fn retransmit_due(&self, cutoff: Instant) -> Vec<usize> {
+        self.flows
+            .iter()
+            .enumerate()
+            .filter_map(|(id, slot)| slot.as_ref().map(|f| (id, f)))
+            .filter(|(_, f)| {
+                !f.closing
+                    && f.tcp
+                        .as_ref()
+                        .is_some_and(|t| t.sent_unacked > 0 && t.last_progress < cutoff)
+            })
             .map(|(id, _)| id)
             .collect()
     }

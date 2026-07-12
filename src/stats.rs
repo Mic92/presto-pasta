@@ -24,6 +24,7 @@ mod imp {
         window_full: u64,
         budget_short: u64,
         dup_ack_retransmits: u64,
+        rto_retransmits: u64,
     }
 
     impl Stats {
@@ -81,6 +82,10 @@ mod imp {
         pub fn dup_ack_retransmit(&mut self) {
             self.dup_ack_retransmits += 1;
         }
+
+        pub fn rto_retransmit(&mut self) {
+            self.rto_retransmits += 1;
+        }
     }
 
     impl Stats {
@@ -114,12 +119,13 @@ mod imp {
                 self.sock_recvs, self.sock_recvs_empty
             );
             eprintln!(
-                "presto stats: guest window last {} max {}, window full {} budget short {} dup-ack retransmits {}",
+                "presto stats: guest window last {} max {}, window full {} budget short {} dup-ack retransmits {} rto retransmits {}",
                 self.guest_window_last,
                 self.guest_window_max,
                 self.window_full,
                 self.budget_short,
-                self.dup_ack_retransmits
+                self.dup_ack_retransmits,
+                self.rto_retransmits
             );
         }
     }
@@ -161,6 +167,8 @@ mod imp {
         pub fn budget_short(&mut self) {}
         #[inline]
         pub fn dup_ack_retransmit(&mut self) {}
+        #[inline]
+        pub fn rto_retransmit(&mut self) {}
     }
 }
 

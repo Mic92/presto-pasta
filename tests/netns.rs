@@ -58,15 +58,7 @@ fn allow_ping_sockets() {
 
 /// Bulk TCP echo through presto: connect, stream 1 MiB, read it back.
 fn tcp_echo(target: &str) {
-    let mut stream = None;
-    for _ in 0..20 {
-        if let Ok(s) = TcpStream::connect(target) {
-            stream = Some(s);
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(300));
-    }
-    let mut stream = stream.unwrap_or_else(|| panic!("connect to {target}"));
+    let mut stream = connect_with_retry(target);
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
@@ -89,6 +81,17 @@ fn tcp_echo(target: &str) {
     writer.join().expect("writer thread");
     assert_eq!(echoed.len(), payload.len(), "echo length from {target}");
     assert_eq!(echoed, payload, "echo content from {target}");
+}
+
+/// Connect through presto, retrying while it is still starting up.
+fn connect_with_retry(target: &str) -> TcpStream {
+    for _ in 0..20 {
+        if let Ok(s) = TcpStream::connect(target) {
+            return s;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    panic!("connect to {target}");
 }
 
 /// Send one ICMP echo request over an unprivileged ping socket and wait
@@ -117,6 +120,20 @@ fn ping(dst: &str) -> bool {
         }
     }
     false
+}
+
+/// Run `nft`, returning whether it succeeded (the binary or the
+/// netfilter modules may be unavailable).
+fn nft(args: &[&str]) -> bool {
+    Command::new("nft")
+        .args(args)
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Byte pattern streamed and verified by the frame-loss test.
+fn pattern(i: usize) -> u8 {
+    u8::try_from(i % 251).expect("remainder fits u8")
 }
 
 fn ip(args: &str) {
@@ -401,6 +418,77 @@ fn bench_host() -> ! {
     exit(i32::from(!(presto_ok && pasta_ok)));
 }
 
+/// Size of the stream used by the frame-loss test.
+const LOSSY_LEN: usize = 8 * 1024 * 1024;
+
+/// Sandbox namespace for the frame-loss test: drop 10% of the packets
+/// presto sends towards the guest and check a bulk download still
+/// completes; only the retransmission timeout recovers a loss at the
+/// tail of a burst.
+fn loss_sandbox() -> ! {
+    let _tap_fd = setup_and_pass_tap();
+    if !(nft(&["add", "table", "inet", "loss"])
+        && nft(&[
+            "add",
+            "chain",
+            "inet",
+            "loss",
+            "input",
+            "{ type filter hook input priority 0; }",
+        ])
+        && nft(&[
+            "add", "rule", "inet", "loss", "input", "numgen", "random", "mod", "10", "0", "drop",
+        ]))
+    {
+        eprintln!("skipping: nftables unavailable");
+        exit(0);
+    }
+    let mut stream = connect_with_retry("10.0.0.1:7979");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let mut data = Vec::with_capacity(LOSSY_LEN);
+    stream
+        .read_to_end(&mut data)
+        .expect("download despite frame loss");
+    assert_eq!(data.len(), LOSSY_LEN, "short download under frame loss");
+    assert!(
+        data.iter().enumerate().all(|(i, b)| *b == pattern(i)),
+        "corrupted download under frame loss"
+    );
+    exit(0);
+}
+
+/// Host namespace for the frame-loss test: stream a fixed pattern to
+/// the first connection, then wait for the sandbox verdict.
+fn loss_host() -> ! {
+    ip("link set lo up");
+    ip("addr add 10.0.0.1/32 dev lo");
+    let listener = TcpListener::bind("10.0.0.1:7979").expect("bind loss stream");
+    std::thread::spawn(move || {
+        let payload: Vec<u8> = (0..LOSSY_LEN).map(pattern).collect();
+        for mut conn in listener.incoming().flatten() {
+            let _ = conn.write_all(&payload);
+        }
+    });
+    let mut child = spawn_sandbox_with_presto("loss-sandbox", "lossy_download");
+    let status = child.wait().expect("wait sandbox");
+    exit(i32::from(!status.success()));
+}
+
+/// Regression test for the retransmission timeout: without it a
+/// dropped tail frame deadlocks the flow and the download never
+/// finishes.
+#[test]
+fn lossy_download() {
+    match std::env::var(ROLE).as_deref() {
+        Ok("loss-host") => loss_host(),
+        Ok("loss-sandbox") => loss_sandbox(),
+        _ => {}
+    }
+    run_in_userns("loss-host", "lossy_download");
+}
+
 /// Throughput comparison against pasta; needs iperf3 and pasta in
 /// PATH. Run with `cargo test --release -- --ignored --nocapture bench`.
 #[test]
@@ -421,14 +509,11 @@ fn bench() {
     assert!(status.success(), "bench run failed");
 }
 
-#[test]
-fn datapath() {
-    match std::env::var(ROLE).as_deref() {
-        Ok("host") => host(),
-        Ok("sandbox") => sandbox(),
-        _ => {}
-    }
-    let output = match reexec_unshared("host", "datapath", &[]).output() {
+/// Re-run this test binary as `role` in a fresh user+net namespace and
+/// fail on any child error; skipped where user namespaces are not
+/// available.
+fn run_in_userns(role: &str, test: &str) {
+    let output = match reexec_unshared(role, test, &[]).output() {
         Ok(o) => o,
         Err(e) => {
             eprintln!("skipping: unshare unavailable: {e}");
@@ -447,4 +532,14 @@ fn datapath() {
             String::from_utf8_lossy(&output.stdout),
         );
     }
+}
+
+#[test]
+fn datapath() {
+    match std::env::var(ROLE).as_deref() {
+        Ok("host") => host(),
+        Ok("sandbox") => sandbox(),
+        _ => {}
+    }
+    run_in_userns("host", "datapath");
 }

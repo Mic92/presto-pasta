@@ -29,8 +29,13 @@ const CANCEL_UD: u64 = u64::MAX - 2;
 
 /// Idle time after which a flow's socket and buffer are reclaimed.
 const FLOW_EXPIRY: Duration = Duration::from_mins(3);
-/// Period of the expiry sweep.
-const TIMER_INTERVAL: Duration = Duration::from_secs(30);
+/// Period of the timer driving the retransmission timeout and the
+/// idle-flow expiry sweep.
+const TIMER_INTERVAL: Duration = Duration::from_millis(500);
+/// Resend in-flight data when the guest has not acknowledged any of it
+/// for this long. Backstop for lost tap frames that fast retransmit
+/// cannot recover (nothing follows the loss, so no duplicate acks).
+const RTO: Duration = Duration::from_millis(500);
 
 /// Initial sequence number towards the guest. The tap is a private
 /// point-to-point link, so ISN randomization buys nothing.
@@ -176,6 +181,7 @@ impl EventLoop {
                     }
                     self.submit_tap_read()?;
                 } else if ud == TIMER_UD {
+                    self.retransmit_stalled_flows();
                     self.expire_flows();
                     self.submit_timer()?;
                 } else if ud == CANCEL_UD {
@@ -232,6 +238,22 @@ impl EventLoop {
             .build()
             .user_data(TIMER_UD);
         self.push(&timeout)
+    }
+
+    /// Resend in-flight data of flows whose acks stalled for `RTO`.
+    fn retransmit_stalled_flows(&mut self) {
+        let Some(cutoff) = Instant::now().checked_sub(RTO) else {
+            return;
+        };
+        for id in self.flows.retransmit_due(cutoff) {
+            if let Some(t) = self.flows.get_mut(id).and_then(|f| f.tcp.as_mut()) {
+                t.sent_unacked = 0;
+                t.dup_acks = 0;
+                t.last_progress = Instant::now();
+                self.stats.rto_retransmit();
+            }
+            self.tcp_data_to_guest(id);
+        }
     }
 
     /// Reclaim every idle flow.
@@ -590,6 +612,7 @@ impl EventLoop {
                 dup_acks: 0,
                 buffered: 0,
                 buf_head: 0,
+                last_progress: Instant::now(),
                 host_eof: false,
                 host_fin: flow::FinState::NotSent,
                 guest_fin_received: false,
@@ -758,6 +781,7 @@ impl EventLoop {
         if advance > 0 && advance <= max_advance {
             let data_acked = advance.min(t.sent_unacked);
             t.dup_acks = 0;
+            t.last_progress = Instant::now();
             t.sent_unacked -= data_acked;
             t.seq_una = t.seq_una.wrapping_add(data_acked);
             if advance > data_acked {
@@ -888,6 +912,7 @@ impl EventLoop {
             {
                 t.sent_unacked += send_len as u32;
             }
+            t.last_progress = Instant::now();
         }
         // Only re-arm when the socket was drained; otherwise guest
         // acks free buffer space and pull in the rest as they arrive.
