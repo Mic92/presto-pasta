@@ -73,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "presto-pasta"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "foldhash",
  "io-uring",
