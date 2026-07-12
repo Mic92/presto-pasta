@@ -31,6 +31,7 @@ use std::sync::Arc;
 pub mod buf;
 pub mod dns;
 pub mod flow;
+pub mod netdev;
 pub mod proto;
 #[cfg(feature = "seccomp")]
 mod seccomp;
