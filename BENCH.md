@@ -8,6 +8,14 @@ dev shell):
 cargo test --release --test netns -- --ignored --nocapture bench
 ```
 
+The `bench_quic` test measures a single QUIC stream with qperf (from
+the dev shell) over the same topology; qperf only transfers from the
+server to the client, so it covers the download direction:
+
+```
+cargo test --release --test netns -- --ignored --nocapture bench_quic
+```
+
 Both backends see the same topology: a user+net namespace holds the
 iperf3 server on a loopback address, the client runs in a nested
 namespace whose only path out is the datapath under test (presto over
@@ -44,7 +52,12 @@ AMD EPYC 9654 (idle), Linux 7.1, 2026-07-12, defaults (64 buffers,
 single thread), tap MTU 65520, `PRESTO_BENCH_CPUS=2,4,6`, 5 s per
 direction, median of 5 runs:
 
-| direction               | presto        | pasta         |
-| ----------------------- | ------------- | ------------- |
-| upload (guest → host)   | 31.2 Gbits/s  | 29.5 Gbits/s  |
-| download (host → guest) | 23.9 Gbits/s  | 9–16 Gbits/s  |
+| direction                    | presto        | pasta         |
+| ---------------------------- | ------------- | ------------- |
+| TCP upload (guest → host)    | 31.2 Gbits/s  | 29.5 Gbits/s  |
+| TCP download (host → guest)  | 23.9 Gbits/s  | 9–16 Gbits/s  |
+| QUIC download (host → guest) | 1.26 Gbits/s  | 0.35 Gbits/s  |
+
+QUIC is a single qperf stream with UDP GSO enabled. The datapath core
+stays mostly idle for both backends; qperf's userspace QUIC stack is
+the bottleneck, so the numbers only show relative per-packet overhead.

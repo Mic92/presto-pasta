@@ -374,6 +374,32 @@ fn bench_sandbox() -> ! {
     exit(0);
 }
 
+/// Re-run this test binary as `role` inside a namespace attached to
+/// pasta, invoked the way sandbox runners do (private netns, no port
+/// forwarding), so the same client measures pasta's datapath.
+fn client_via_pasta(test: &str, role: &str) -> bool {
+    pinned(bench_cpus().as_ref().map(|c| c[1].as_str()), "pasta")
+        .args([
+            "--config-net",
+            "--quiet",
+            "-t",
+            "none",
+            "-u",
+            "none",
+            "-T",
+            "none",
+            "-U",
+            "none",
+            "--",
+        ])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--include-ignored", "--nocapture"])
+        .env(ROLE, role)
+        .status()
+        .expect("run pasta")
+        .success()
+}
+
 /// Bench host namespace: iperf3 server plus presto, then the same
 /// measurement through pasta attached to its own namespace.
 fn bench_host() -> ! {
@@ -390,32 +416,88 @@ fn bench_host() -> ! {
     let mut child = spawn_sandbox_with_presto("bench-sandbox", "bench");
     let presto_ok = child.wait().expect("wait bench sandbox").success();
 
-    // Same measurement through pasta, invoked the way sandbox runners
-    // do (private netns, no port forwarding).
-    let pasta_ok = pinned(cpus.as_ref().map(|c| c[1].as_str()), "pasta")
-        .args([
-            "--config-net",
-            "--quiet",
-            "-t",
-            "none",
-            "-u",
-            "none",
-            "-T",
-            "none",
-            "-U",
-            "none",
-            "--",
-        ])
-        .arg(std::env::current_exe().unwrap())
-        .args(["--exact", "bench", "--include-ignored", "--nocapture"])
-        .env(ROLE, "bench-pasta")
-        .status()
-        .expect("run pasta")
-        .success();
+    let pasta_ok = client_via_pasta("bench", "bench-pasta");
 
     let _ = server.kill();
     let _ = server.wait();
     exit(i32::from(!(presto_ok && pasta_ok)));
+}
+
+/// Run the qperf client against the host-side server. qperf only
+/// measures server-to-client bulk transfer, i.e. downloads.
+fn qperf_client(label: &str) {
+    let cpus = bench_cpus();
+    println!("=== {label} quic download ===");
+    let status = pinned(cpus.as_ref().map(|c| c[2].as_str()), "qperf")
+        .args(["-c", "10.0.0.1", "-p", "18000", "-t", "5", "-g", "-i", "1"])
+        .status()
+        .expect("run qperf client");
+    assert!(status.success(), "qperf {label} failed");
+}
+
+/// QUIC bench sandbox namespace: configure the tap, then measure with
+/// qperf.
+fn quic_sandbox() -> ! {
+    let _tap_fd = setup_and_pass_tap();
+    qperf_client("presto");
+    exit(0);
+}
+
+/// QUIC bench host namespace: qperf server plus presto, then the same
+/// measurement through pasta.
+fn quic_host() -> ! {
+    ip("link set lo up");
+    ip("addr add 10.0.0.1/32 dev lo");
+
+    // qperf expects server.crt/server.key in its working directory;
+    // the client does not validate them.
+    let dir = std::env::temp_dir().join(format!("presto-qperf-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create qperf dir");
+    let status = Command::new("openssl")
+        .current_dir(&dir)
+        .args("req -x509 -newkey rsa:2048 -nodes -keyout server.key -out server.crt -days 1 -subj /CN=presto-bench".split_whitespace())
+        .status()
+        .expect("run openssl");
+    assert!(status.success(), "generate qperf certificate");
+
+    let cpus = bench_cpus();
+    let mut server = pinned(cpus.as_ref().map(|c| c[0].as_str()), "qperf")
+        .current_dir(&dir)
+        .args(["-s", "10.0.0.1", "-p", "18000", "-i", "1", "-g"])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("start qperf server");
+
+    let mut child = spawn_sandbox_with_presto("quic-sandbox", "bench_quic");
+    let presto_ok = child.wait().expect("wait quic sandbox").success();
+
+    let pasta_ok = client_via_pasta("bench_quic", "quic-pasta");
+
+    let _ = server.kill();
+    let _ = server.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    exit(i32::from(!(presto_ok && pasta_ok)));
+}
+
+/// QUIC throughput comparison against pasta; needs qperf, openssl and
+/// pasta in PATH. Run with `cargo test --release -- --ignored
+/// --nocapture bench_quic`.
+#[test]
+#[ignore = "benchmark, run explicitly"]
+fn bench_quic() {
+    match std::env::var(ROLE).as_deref() {
+        Ok("quic-host") => quic_host(),
+        Ok("quic-sandbox") => quic_sandbox(),
+        Ok("quic-pasta") => {
+            qperf_client("pasta");
+            exit(0);
+        }
+        _ => {}
+    }
+    let status = reexec_unshared("quic-host", "bench_quic", &[])
+        .status()
+        .expect("unshare");
+    assert!(status.success(), "bench_quic run failed");
 }
 
 /// Size of the stream used by the frame-loss test.

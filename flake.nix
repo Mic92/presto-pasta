@@ -20,6 +20,35 @@
           src = self;
           cargoLock.lockFile = ./Cargo.lock;
         };
+
+        # QUIC throughput tool (iperf-like, quicly based) used by the
+        # bench_quic test.
+        qperf = pkgs.stdenv.mkDerivation {
+          pname = "qperf";
+          version = "unstable-2024-06-20";
+          src = pkgs.fetchFromGitHub {
+            owner = "qubasa";
+            repo = "qperf";
+            rev = "423098cdc67f6b100b7413af1a876ef51722460d";
+            hash = "sha256-Xlk5dpuq0+p7pPHijXDTPnxUK915DBOxgtDcES3tmbA=";
+            fetchSubmodules = true;
+          };
+          nativeBuildInputs = with pkgs; [
+            cmake
+            pkg-config
+            perl
+          ];
+          buildInputs = with pkgs; [
+            openssl
+            libev
+          ];
+          # Bundled quicly still uses pre-3.5 CMake syntax.
+          env.CMAKE_POLICY_VERSION_MINIMUM = "3.5";
+          installPhase = ''
+            install -Dm755 qperf $out/bin/qperf
+          '';
+          meta.mainProgram = "qperf";
+        };
       });
 
       devShells = forAllSystems (pkgs: {
@@ -36,6 +65,9 @@
             # benchmark (tests/netns.rs bench, run with --ignored)
             iperf3
             passt
+            # QUIC benchmark (tests/netns.rs bench_quic)
+            self.packages.${pkgs.stdenv.hostPlatform.system}.qperf
+            openssl
           ];
         };
       });
