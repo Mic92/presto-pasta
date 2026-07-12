@@ -47,12 +47,18 @@ addresses, routes and a neighbor entry for the gateway MAC, point
 resolv.conf at the gateway, then:
 
 ```rust
-let mut presto = presto_pasta::Presto::new(presto_pasta::Config::default(), tap_fd);
+let cfg = presto_pasta::Config {
+    // Internet only: no host LANs, VPN subnets or link-local services.
+    // Without a callback the default policy refuses loopback destinations.
+    allow_flow: Some(std::sync::Arc::new(|dst: &presto_pasta::FlowDst| dst.is_public())),
+    ..presto_pasta::Config::default()
+};
+let mut presto = presto_pasta::Presto::new(cfg, tap_fd);
 let liveness = presto.liveness_fd()?;   // POLLHUP when the datapath dies
 std::thread::spawn(move || presto.run());
 ```
 
-`Config` carries the guest/gateway addresses (defaults suit build
+`Config` also carries the guest/gateway addresses (defaults suit build
 sandboxes), DNS forwarding and the buffer pool size. The netns test in
 [`tests/netns.rs`](tests/netns.rs) is a complete, runnable example of
 the namespace and tap setup.

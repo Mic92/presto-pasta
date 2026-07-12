@@ -430,6 +430,9 @@ impl EventLoop {
     /// resolver, re-read from resolv.conf per flow so changes (e.g. by
     /// a DHCP client on the host) are picked up without a reload.
     fn new_flow(&mut self, key: flow::FlowKey, kind: flow::FlowKind) -> Option<usize> {
+        if !self.flow_allowed(&key) {
+            return None;
+        }
         let sock = match kind {
             flow::FlowKind::Udp => {
                 let gateway_dns = key.dst.port() == 53
@@ -471,6 +474,20 @@ impl EventLoop {
         });
         self.submit_flow_recv(id).ok()?;
         Some(id)
+    }
+
+    /// Apply the caller's flow policy (or the default: refuse loopback
+    /// destinations) to a new flow.
+    fn flow_allowed(&self, key: &flow::FlowKey) -> bool {
+        let dst = crate::FlowDst {
+            proto: key.proto,
+            ip: key.dst.ip(),
+            port: key.dst.port(),
+        };
+        match &self.cfg.allow_flow {
+            Some(filter) => filter(&dst),
+            None => !dst.ip.is_loopback(),
+        }
     }
 
     /// Deliver a received UDP datagram of `len` bytes to the guest.
@@ -642,6 +659,9 @@ impl EventLoop {
     /// its outcome; the SYN-ACK is only sent once the host connection
     /// is established, so connection refusal maps to RST.
     fn new_tcp_flow(&mut self, key: flow::FlowKey, syn: &proto::TcpHdr) -> Option<usize> {
+        if !self.flow_allowed(&key) {
+            return None; // no SYN-ACK; the guest times out
+        }
         let family = if key.dst.is_ipv4() {
             AddressFamily::Inet
         } else {
