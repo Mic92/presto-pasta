@@ -14,6 +14,8 @@ pub mod buf;
 pub mod dns;
 pub mod flow;
 pub mod proto;
+#[cfg(feature = "seccomp")]
+mod seccomp;
 pub mod tap;
 pub mod uring;
 
@@ -93,6 +95,10 @@ impl Presto {
     ///
     /// Returns I/O errors from the ring or the tap fd.
     pub fn run(self) -> io::Result<()> {
-        uring::EventLoop::new(&self.cfg, self.tap)?.run()
+        let event_loop = uring::EventLoop::new(&self.cfg, self.tap)?;
+        // After setup so ring and tap initialization stay unrestricted.
+        #[cfg(feature = "seccomp")]
+        seccomp::apply()?;
+        event_loop.run()
     }
 }
