@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="400" viewBox="0 0 960 400" font-family="sans-serif" font-size="14">
+  <style>
+    .lane-title { font-weight: bold; }
+    .note { font-size: 12px; fill: #5a5a5a; }
+    .step { font-size: 13px; }
+    .box { fill: #ffffff; }
+    .link { stroke: #333333; stroke-width: 2; fill: none; }
+    .flow { stroke: #7a6420; stroke-width: 1.5; fill: none; }
+    .head { fill: #333333; stroke: none; }
+    .fhead { fill: #7a6420; stroke: none; }
+  </style>
+
+  <!-- ===================== sandbox netns ===================== -->
+  <rect x="20" y="30" width="250" height="340" rx="12" fill="#e8f1fb" stroke="#4a78a8" stroke-width="1.5"/>
+  <text x="145" y="58" text-anchor="middle" class="lane-title" fill="#2c4a68">sandbox netns</text>
+  <text x="145" y="76" text-anchor="middle" class="note">created by the caller</text>
+
+  <rect x="45" y="95" width="200" height="70" rx="8" class="box" stroke="#4a78a8"/>
+  <text x="145" y="124" text-anchor="middle">build / job</text>
+  <text x="145" y="144" text-anchor="middle">processes</text>
+
+  <rect x="45" y="265" width="200" height="80" rx="8" class="box" stroke="#4a78a8"/>
+  <text x="145" y="294" text-anchor="middle">tap device (eth0)</text>
+  <text x="145" y="316" text-anchor="middle" class="note">IFF_VNET_HDR · TSO / USO</text>
+  <text x="145" y="361" text-anchor="middle" class="note">fd opened by the caller</text>
+
+  <!-- guest <-> tap -->
+  <line x1="160" y1="175" x2="160" y2="255" class="link"/>
+  <polygon class="head" points="160,165 154,177 166,177"/>
+  <polygon class="head" points="160,265 154,253 166,253"/>
+  <text x="137" y="203" text-anchor="end" class="note">Ethernet frames</text>
+  <text x="137" y="220" text-anchor="end" class="note">(sandbox kernel</text>
+  <text x="137" y="236" text-anchor="end" class="note">TCP/IP stack)</text>
+
+  <!-- ===================== runner process ===================== -->
+  <rect x="300" y="30" width="400" height="340" rx="12" fill="#f6f1df" stroke="#a08a3c" stroke-width="1.5"/>
+  <text x="500" y="58" text-anchor="middle" class="lane-title" fill="#5e5220">runner process (unprivileged)</text>
+  <text x="500" y="76" text-anchor="middle" class="note">build system / sandbox runner</text>
+
+  <rect x="320" y="95" width="360" height="250" rx="8" class="box" stroke="#a08a3c"/>
+  <text x="500" y="117" text-anchor="middle" font-weight="bold">presto-pasta thread — io_uring event loop</text>
+  <line x1="335" y1="127" x2="665" y2="127" stroke="#d8cfae" stroke-width="1"/>
+
+  <!-- guest -> host row -->
+  <text x="337" y="147" class="note">sandbox → host</text>
+  <rect x="335" y="155" width="160" height="46" rx="6" fill="#fbf8ee" stroke="#a08a3c"/>
+  <text x="415" y="174" text-anchor="middle" class="step">parse frame,</text>
+  <text x="415" y="192" text-anchor="middle" class="step">flow table lookup</text>
+  <rect x="525" y="155" width="140" height="46" rx="6" fill="#fbf8ee" stroke="#a08a3c"/>
+  <text x="595" y="174" text-anchor="middle" class="step">payload to the</text>
+  <text x="595" y="192" text-anchor="middle" class="step">flow's socket</text>
+  <line x1="495" y1="178" x2="515" y2="178" class="flow"/>
+  <polygon class="fhead" points="525,178 514,173 514,183"/>
+
+  <!-- host -> guest row -->
+  <text x="663" y="230" text-anchor="end" class="note">host → sandbox</text>
+  <rect x="525" y="238" width="140" height="46" rx="6" fill="#fbf8ee" stroke="#a08a3c"/>
+  <!-- ring buffer glyph -->
+  <circle cx="551" cy="261" r="13" fill="none" stroke="#c9b878" stroke-width="7"/>
+  <path d="M 551 248 A 13 13 0 0 1 563.5 265" fill="none" stroke="#7a6420" stroke-width="7"/>
+  <text x="614" y="257" text-anchor="middle" class="step">recv into per-</text>
+  <text x="614" y="275" text-anchor="middle" class="step">flow ring buffer</text>
+  <rect x="335" y="238" width="160" height="46" rx="6" fill="#fbf8ee" stroke="#a08a3c"/>
+  <text x="415" y="257" text-anchor="middle" class="step">rewrite headers,</text>
+  <text x="415" y="275" text-anchor="middle" class="step">GSO super-frame to tap</text>
+  <line x1="525" y1="261" x2="505" y2="261" class="flow"/>
+  <polygon class="fhead" points="495,261 506,256 506,266"/>
+
+  <line x1="335" y1="300" x2="665" y2="300" stroke="#d8cfae" stroke-width="1"/>
+  <text x="500" y="328" text-anchor="middle" class="note">confined by seccomp filter + io_uring op allowlist</text>
+
+  <!-- tap fd connector -->
+  <line x1="252" y1="305" x2="313" y2="305" class="link"/>
+  <polygon class="head" points="245,305 254,300 254,310"/>
+  <polygon class="head" points="320,305 311,300 311,310"/>
+  <rect x="259" y="274" width="52" height="20" rx="6" fill="#ffffff" stroke="#bbbbbb"/>
+  <text x="285" y="288" text-anchor="middle" class="note">tap fd</text>
+
+  <!-- ===================== host kernel ===================== -->
+  <rect x="730" y="30" width="210" height="340" rx="12" fill="#e9f5ec" stroke="#4a8a58" stroke-width="1.5"/>
+  <text x="835" y="58" text-anchor="middle" class="lane-title" fill="#2d5738">host kernel</text>
+  <text x="835" y="76" text-anchor="middle" class="note">runs the real TCP stack</text>
+
+  <rect x="750" y="95" width="170" height="100" rx="8" class="box" stroke="#4a8a58"/>
+  <text x="835" y="126" text-anchor="middle">connected sockets</text>
+  <text x="835" y="148" text-anchor="middle">TCP · UDP · ICMP</text>
+  <text x="835" y="172" text-anchor="middle" class="note">one per flow</text>
+
+  <rect x="750" y="265" width="170" height="80" rx="8" class="box" stroke="#4a8a58"/>
+  <text x="835" y="296" text-anchor="middle">host interfaces,</text>
+  <text x="835" y="318" text-anchor="middle">outside network</text>
+
+  <!-- sockets <-> host stack -->
+  <line x1="835" y1="205" x2="835" y2="255" class="link"/>
+  <polygon class="head" points="835,195 829,207 841,207"/>
+  <polygon class="head" points="835,265 829,253 841,253"/>
+
+  <!-- presto <-> sockets connector -->
+  <line x1="687" y1="145" x2="743" y2="145" class="link"/>
+  <polygon class="head" points="680,145 689,140 689,150"/>
+  <polygon class="head" points="750,145 741,140 741,150"/>
+  <rect x="673" y="108" width="84" height="20" rx="6" fill="#ffffff" stroke="#bbbbbb"/>
+  <text x="715" y="122" text-anchor="middle" class="note">send / recv</text>
+</svg>

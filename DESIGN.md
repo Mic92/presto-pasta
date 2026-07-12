@@ -1,10 +1,9 @@
 # presto-pasta — design
 
-User-mode NAT datapath for sandboxes. Library only, no CLI.
+What presto-pasta is for and how to embed it is covered in the
+[README](README.md); this document describes how the datapath works.
 
-Consumers are build systems and sandbox runners that give an isolated
-build outbound network access: TCP, UDP, ICMP echo, DNS. No inbound
-port forwarding.
+![architecture](docs/architecture.svg)
 
 ## Model
 
@@ -59,12 +58,7 @@ pcap.
 
 ## API
 
-```rust
-let presto-pasta = presto_pasta::Presto::new(presto_pasta::Config::default(), tap_fd)?;
-let liveness = presto-pasta.liveness_fd();
-presto-pasta.run()?; // until the tap fd is torn down
-```
-
-`Config`: gateway/guest addresses (to synthesize headers and recognize
-DNS traffic), GSO limits, buffer pool size. Defaults use link-local v4
+See the usage snippet in the [README](README.md). `Config`:
+gateway/guest addresses (to synthesize headers and recognize DNS
+traffic), DNS forwarding, buffer pool size. Defaults use link-local v4
 and a fixed ULA-style v6 scheme suitable for build sandboxes.
