@@ -63,13 +63,13 @@ direction, median of 5 runs:
 | ---------------------------- | ------------- | ------------- |
 | TCP upload (guest → host)    | 31.2 Gbits/s  | 29.5 Gbits/s  |
 | TCP download (host → guest)  | 23.9 Gbits/s  | 9–16 Gbits/s  |
-| UDP upload (guest → host)    | 1.96 Gbits/s  | 1.23 Gbits/s  |
-| UDP download (host → guest)  | 2.37 Gbits/s  | 0.56 Gbits/s  |
-| QUIC download (host → guest) | 1.26 Gbits/s  | 0.35 Gbits/s  |
+| UDP upload (guest → host)    | 1.95 Gbits/s  | 1.24 Gbits/s  |
+| UDP download (host → guest)  | 3.52 Gbits/s  | 0.56 Gbits/s  |
+| QUIC download (host → guest) | 4.63 Gbits/s  | 0.36 Gbits/s  |
 
 UDP rows are receiver goodput (the unlimited sender always overruns
-the path) from a single run, not a median; here the datapath core is
-the bottleneck because every datagram costs one socket receive and
-one tap write. QUIC is a single qperf stream with UDP GSO enabled;
-there the datapath core stays mostly idle for both backends and
-qperf's userspace QUIC stack is the bottleneck.
+the path) from a single run, not a median. QUIC is a single qperf
+stream. In the download direction presto coalesces datagrams into UDP
+GSO super-frames, so the sending endpoint is the bottleneck (0% loss
+for iperf3); on upload every guest datagram still costs one socket
+send, and pasta pays per-datagram cost in both directions.

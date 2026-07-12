@@ -290,20 +290,26 @@ impl UdpHdr {
 
     /// Write header and checksum into `out`, which must already hold
     /// the payload after the first 8 bytes. `pseudo` is the pseudo
-    /// header sum from [`pseudo_v4`].
+    /// header sum from [`pseudo_v4`]; with `csum_offload` the checksum
+    /// field carries just the folded pseudo-header sum for the tap
+    /// device to complete.
     ///
     /// # Panics
     ///
     /// Panics if `out` exceeds a UDP datagram (65535 bytes).
-    pub fn write(out: &mut [u8], src_port: u16, dst_port: u16, pseudo: u32) {
+    pub fn write(out: &mut [u8], src_port: u16, dst_port: u16, pseudo: u32, csum_offload: bool) {
         let len = u16::try_from(out.len()).expect("UDP datagram fits u16");
         out[0..2].copy_from_slice(&src_port.to_be_bytes());
         out[2..4].copy_from_slice(&dst_port.to_be_bytes());
         out[4..6].copy_from_slice(&len.to_be_bytes());
         out[6..8].copy_from_slice(&[0, 0]);
-        let csum = match checksum(out, pseudo) {
-            0 => 0xffff,
-            c => c,
+        let csum = if csum_offload {
+            !checksum(&[], pseudo)
+        } else {
+            match checksum(out, pseudo) {
+                0 => 0xffff,
+                c => c,
+            }
         };
         out[6..8].copy_from_slice(&csum.to_be_bytes());
     }
@@ -395,7 +401,13 @@ mod tests {
         let mut dgram = vec![0u8; UDP_HDR_LEN + 2];
         dgram[UDP_HDR_LEN..].copy_from_slice(b"hi");
         let len = u16::try_from(dgram.len()).unwrap();
-        UdpHdr::write(&mut dgram, 40000, 53, pseudo_v4(src, dst, IPPROTO_UDP, len));
+        UdpHdr::write(
+            &mut dgram,
+            40000,
+            53,
+            pseudo_v4(src, dst, IPPROTO_UDP, len),
+            false,
+        );
         // Verifying the checksum over pseudo header + datagram yields 0.
         assert_eq!(checksum(&dgram, pseudo_v4(src, dst, IPPROTO_UDP, len)), 0);
     }

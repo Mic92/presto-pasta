@@ -20,6 +20,7 @@ pub const VNET_HDR_LEN: usize = 10;
 pub const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
 pub const VIRTIO_NET_HDR_GSO_TCPV4: u8 = 1;
 pub const VIRTIO_NET_HDR_GSO_TCPV6: u8 = 4;
+pub const VIRTIO_NET_HDR_GSO_UDP_L4: u8 = 5;
 
 /// Parsed `struct virtio_net_hdr`.
 #[derive(Debug, Clone, Copy, Default)]

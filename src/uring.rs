@@ -204,7 +204,12 @@ impl EventLoop {
                         }
                     } else {
                         if res >= 0 {
-                            self.reply_to_guest(id, res.unsigned_abs() as usize);
+                            let len = res.unsigned_abs() as usize;
+                            if f.kind == flow::FlowKind::Udp {
+                                self.udp_to_guest(id, len);
+                            } else {
+                                self.reply_to_guest(id, len, None);
+                            }
                         }
                         self.submit_flow_recv(id)?;
                     }
@@ -468,9 +473,67 @@ impl EventLoop {
         Some(id)
     }
 
+    /// Deliver a received UDP datagram of `len` bytes to the guest.
+    /// When the tap supports UDP GSO, further datagrams waiting on the
+    /// socket are drained into the same buffer first and equal-sized
+    /// runs leave as one super-frame that the guest kernel resegments;
+    /// without it every datagram costs one tap write.
+    fn udp_to_guest(&mut self, id: usize, len: usize) {
+        let offloads = self.tap.offloads();
+        if !(offloads.uso() && offloads.csum()) || len == 0 {
+            self.reply_to_guest(id, len, None);
+            return;
+        }
+        let Some(f) = self.flows.get_by_id(id) else {
+            return;
+        };
+        let raw = f.sock.as_raw_fd();
+        let buf_id = f.buf;
+        // The IPv4 total-length field bounds a super-frame's payload;
+        // it is tighter than IPv6's payload length (which excludes the
+        // IP header), so one bound covers both families.
+        let max = usize::from(u16::MAX) - proto::IPV4_HDR_LEN - proto::UDP_HDR_LEN;
+        let mut seg = len; // resegmentation size of the current super-frame
+        let mut total = len;
+        loop {
+            // The buffer keeps at least a full datagram of space beyond
+            // `max`, so drained datagrams are never truncated.
+            let room = &mut self.pool.get_mut(buf_id)[buf::HEADROOM + total..];
+            let Ok(n) = recv(raw, room, MsgFlags::MSG_DONTWAIT) else {
+                break;
+            };
+            self.stats.sock_recv(n == 0);
+            if n == 0 {
+                break;
+            }
+            if n <= seg && total + n <= max {
+                total += n;
+                if n < seg {
+                    // A shorter datagram becomes the super-frame's
+                    // tail segment.
+                    break;
+                }
+                continue;
+            }
+            // The datagram does not fit this super-frame (larger than
+            // the segment size or over the length limit): flush what we
+            // have and start a new super-frame with it.
+            self.reply_to_guest(id, total, gso_of(total, seg));
+            let b = self.pool.get_mut(buf_id);
+            b.copy_within(
+                buf::HEADROOM + total..buf::HEADROOM + total + n,
+                buf::HEADROOM,
+            );
+            seg = n;
+            total = n;
+        }
+        self.reply_to_guest(id, total, gso_of(total, seg));
+    }
+
     /// Build the ethernet/IP/L4 frame for `len` payload bytes sitting
     /// at the flow buffer's headroom offset and write it to the tap.
-    fn reply_to_guest(&mut self, id: usize, len: usize) {
+    /// `gso_size` marks a UDP super-frame the guest resegments.
+    fn reply_to_guest(&mut self, id: usize, len: usize, gso_size: Option<u16>) {
         let Some(f) = self.flows.get_mut(id) else {
             return;
         };
@@ -512,6 +575,7 @@ impl EventLoop {
                 key.dst.port(),
                 key.guest_port,
                 pseudo,
+                gso_size.is_some(),
             ),
             flow::FlowKind::Ping => {
                 if len < proto::ICMP_HDR_LEN {
@@ -539,7 +603,18 @@ impl EventLoop {
             },
         }
         .write(&mut b[eth_start..]);
-        b[vnet_start..eth_start].fill(0);
+        let vnet = match gso_size {
+            Some(gso) => tap::VnetHdr {
+                flags: tap::VIRTIO_NET_HDR_F_NEEDS_CSUM,
+                gso_type: tap::VIRTIO_NET_HDR_GSO_UDP_L4,
+                hdr_len: u16::try_from(buf::HEADROOM - eth_start).unwrap_or(0),
+                gso_size: gso,
+                csum_start: u16::try_from(l4_start - eth_start).unwrap_or(0),
+                csum_offset: 6, // UDP checksum field offset
+            },
+            None => tap::VnetHdr::default(),
+        };
+        b[vnet_start..eth_start].copy_from_slice(&vnet.to_bytes());
 
         self.stats.tap_out(end - vnet_start);
         let _ = nix::unistd::write(self.tap.fd(), &b[vnet_start..end]);
@@ -1173,6 +1248,12 @@ impl EventLoop {
         ];
         let _ = nix::sys::uio::writev(self.tap.fd(), &iov);
     }
+}
+
+/// UDP GSO segment size for a super-frame of `total` payload bytes
+/// resegmented at `seg`; single-datagram frames carry no GSO metadata.
+fn gso_of(total: usize, seg: usize) -> Option<u16> {
+    (total > seg).then(|| u16::try_from(seg).unwrap_or(u16::MAX))
 }
 
 /// One TCP segment towards the guest; `payload` and `payload2` are
