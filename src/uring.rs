@@ -689,6 +689,7 @@ impl EventLoop {
         let mut ack_guest = false;
         if hdr.flags & proto::TCP_ACK != 0 {
             t.guest_window = u32::from(hdr.window) << t.guest_wscale.unwrap_or(0);
+            self.stats.guest_window(t.guest_window);
             let advance = hdr.ack.wrapping_sub(t.seq_una);
             let max_advance = t.sent_unacked + u32::from(t.host_fin != flow::FinState::NotSent);
             if advance > 0 && advance <= max_advance {
@@ -709,6 +710,7 @@ impl EventLoop {
                 // Duplicate ack: retransmit everything in flight by
                 // re-peeking it from the socket.
                 t.sent_unacked = 0;
+                self.stats.dup_ack_retransmit();
             }
         }
         // Guest payload into the host socket. Only in-order data is
@@ -800,6 +802,7 @@ impl EventLoop {
         let ack = t.seq_from_guest;
         let poll_armed = t.poll_armed;
         if budget == 0 {
+            self.stats.window_full();
             return; // window full; the next guest ack retriggers
         }
         let max_peek = buf::FRAME.min(sent + budget);
@@ -833,6 +836,9 @@ impl EventLoop {
             return; // everything readable is already in flight
         }
         let send_len = new.min(budget).min(TCP_MAX_PAYLOAD);
+        if new > budget {
+            self.stats.budget_short();
+        }
         let window = self.tcp_window_to_guest(id);
         let use_gso = self.tap.offloads().tso() && send_len > usize::from(mss);
         let chunk = if use_gso {

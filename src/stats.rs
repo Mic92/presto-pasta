@@ -19,6 +19,11 @@ mod imp {
         sock_send_shortfall: u64,
         peeks: u64,
         peeks_empty: u64,
+        guest_window_last: u64,
+        guest_window_max: u64,
+        window_full: u64,
+        budget_short: u64,
+        dup_ack_retransmits: u64,
     }
 
     impl Stats {
@@ -59,6 +64,23 @@ mod imp {
             self.peeks += 1;
             self.peeks_empty += u64::from(empty);
         }
+
+        pub fn guest_window(&mut self, window: u32) {
+            self.guest_window_last = u64::from(window);
+            self.guest_window_max = self.guest_window_max.max(u64::from(window));
+        }
+
+        pub fn window_full(&mut self) {
+            self.window_full += 1;
+        }
+
+        pub fn budget_short(&mut self) {
+            self.budget_short += 1;
+        }
+
+        pub fn dup_ack_retransmit(&mut self) {
+            self.dup_ack_retransmits += 1;
+        }
     }
 
     impl Stats {
@@ -90,6 +112,14 @@ mod imp {
             eprintln!(
                 "presto stats: peeks {} empty {}",
                 self.peeks, self.peeks_empty
+            );
+            eprintln!(
+                "presto stats: guest window last {} max {}, window full {} budget short {} dup-ack retransmits {}",
+                self.guest_window_last,
+                self.guest_window_max,
+                self.window_full,
+                self.budget_short,
+                self.dup_ack_retransmits
             );
         }
     }
@@ -123,6 +153,14 @@ mod imp {
         pub fn sock_send(&mut self, _accepted: usize, _wanted: usize) {}
         #[inline]
         pub fn peek(&mut self, _empty: bool) {}
+        #[inline]
+        pub fn guest_window(&mut self, _window: u32) {}
+        #[inline]
+        pub fn window_full(&mut self) {}
+        #[inline]
+        pub fn budget_short(&mut self) {}
+        #[inline]
+        pub fn dup_ack_retransmit(&mut self) {}
     }
 }
 
