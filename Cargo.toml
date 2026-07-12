@@ -9,9 +9,10 @@ description = "User-mode NAT datapath for sandboxes: L2 tap to native host socke
 libc = "0.2"
 nix = { version = "0.31", features = ["net", "socket", "uio", "fs", "ioctl"] }
 io-uring = "0.7"
+foldhash = "0.2"
 
 [dev-dependencies]
-nix = { version = "0.31", features = ["ioctl"] }
+nix = { version = "0.31", features = ["ioctl", "socket", "uio"] }
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

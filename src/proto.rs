@@ -1,7 +1,12 @@
 //! Wire formats: ethernet, IPv4/IPv6, TCP/UDP/ICMP header views and
 //! builders, plus the internet checksum for the no-offload fallback.
 
+use std::net::{Ipv4Addr, Ipv6Addr};
+
 pub const ETH_LEN: usize = 14;
+pub const IPV4_HDR_LEN: usize = 20;
+pub const IPV6_HDR_LEN: usize = 40;
+pub const UDP_HDR_LEN: usize = 8;
 pub const ETHERTYPE_IPV4: u16 = 0x0800;
 pub const ETHERTYPE_IPV6: u16 = 0x86dd;
 
@@ -38,6 +43,156 @@ impl EthHdr {
     }
 }
 
+/// IPv4 header view.
+#[derive(Debug, Clone, Copy)]
+pub struct Ipv4Hdr {
+    pub src: Ipv4Addr,
+    pub dst: Ipv4Addr,
+    pub proto: u8,
+    pub header_len: usize,
+    pub total_len: u16,
+}
+
+impl Ipv4Hdr {
+    #[must_use]
+    pub fn parse(b: &[u8]) -> Option<Self> {
+        if b.len() < IPV4_HDR_LEN || b[0] >> 4 != 4 {
+            return None;
+        }
+        let header_len = usize::from(b[0] & 0xf) * 4;
+        if header_len < IPV4_HDR_LEN || b.len() < header_len {
+            return None;
+        }
+        Some(Self {
+            src: Ipv4Addr::new(b[12], b[13], b[14], b[15]),
+            dst: Ipv4Addr::new(b[16], b[17], b[18], b[19]),
+            proto: b[9],
+            header_len,
+            total_len: u16::from_be_bytes([b[2], b[3]]),
+        })
+    }
+
+    /// Write a 20-byte header (no options) with checksum for a payload
+    /// of `payload_len` bytes.
+    pub fn write(out: &mut [u8], src: Ipv4Addr, dst: Ipv4Addr, proto: u8, payload_len: u16) {
+        let out = &mut out[..IPV4_HDR_LEN];
+        out.fill(0);
+        out[0] = 0x45;
+        out[2..4].copy_from_slice(&(payload_len + 20).to_be_bytes());
+        out[6] = 0x40; // DF
+        out[8] = 64; // TTL
+        out[9] = proto;
+        out[12..16].copy_from_slice(&src.octets());
+        out[16..20].copy_from_slice(&dst.octets());
+        let csum = checksum(out, 0);
+        out[10..12].copy_from_slice(&csum.to_be_bytes());
+    }
+}
+
+/// IPv6 header view. Extension headers are not parsed; packets that
+/// carry them are dropped by the datapath.
+#[derive(Debug, Clone, Copy)]
+pub struct Ipv6Hdr {
+    pub src: Ipv6Addr,
+    pub dst: Ipv6Addr,
+    pub next_header: u8,
+    pub payload_len: u16,
+}
+
+impl Ipv6Hdr {
+    #[must_use]
+    pub fn parse(b: &[u8]) -> Option<Self> {
+        if b.len() < IPV6_HDR_LEN || b[0] >> 4 != 6 {
+            return None;
+        }
+        let src: [u8; 16] = b[8..24].try_into().ok()?;
+        let dst: [u8; 16] = b[24..40].try_into().ok()?;
+        Some(Self {
+            src: Ipv6Addr::from(src),
+            dst: Ipv6Addr::from(dst),
+            next_header: b[6],
+            payload_len: u16::from_be_bytes([b[4], b[5]]),
+        })
+    }
+
+    /// Write a 40-byte header for a payload of `payload_len` bytes.
+    pub fn write(out: &mut [u8], src: Ipv6Addr, dst: Ipv6Addr, next_header: u8, payload_len: u16) {
+        let out = &mut out[..IPV6_HDR_LEN];
+        out.fill(0);
+        out[0] = 0x60;
+        out[4..6].copy_from_slice(&payload_len.to_be_bytes());
+        out[6] = next_header;
+        out[7] = 64; // hop limit
+        out[8..24].copy_from_slice(&src.octets());
+        out[24..40].copy_from_slice(&dst.octets());
+    }
+}
+
+/// UDP header view.
+#[derive(Debug, Clone, Copy)]
+pub struct UdpHdr {
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub len: u16,
+}
+
+impl UdpHdr {
+    #[must_use]
+    pub fn parse(b: &[u8]) -> Option<Self> {
+        if b.len() < UDP_HDR_LEN {
+            return None;
+        }
+        Some(Self {
+            src_port: u16::from_be_bytes([b[0], b[1]]),
+            dst_port: u16::from_be_bytes([b[2], b[3]]),
+            len: u16::from_be_bytes([b[4], b[5]]),
+        })
+    }
+
+    /// Write header and checksum into `out`, which must already hold
+    /// the payload after the first 8 bytes. `pseudo` is the pseudo
+    /// header sum from [`pseudo_v4`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `out` exceeds a UDP datagram (65535 bytes).
+    pub fn write(out: &mut [u8], src_port: u16, dst_port: u16, pseudo: u32) {
+        let len = u16::try_from(out.len()).expect("UDP datagram fits u16");
+        out[0..2].copy_from_slice(&src_port.to_be_bytes());
+        out[2..4].copy_from_slice(&dst_port.to_be_bytes());
+        out[4..6].copy_from_slice(&len.to_be_bytes());
+        out[6..8].copy_from_slice(&[0, 0]);
+        let csum = match checksum(out, pseudo) {
+            0 => 0xffff,
+            c => c,
+        };
+        out[6..8].copy_from_slice(&csum.to_be_bytes());
+    }
+}
+
+/// Pseudo-header sum for IPv4 UDP/TCP checksums.
+#[must_use]
+pub fn pseudo_v4(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, len: u16) -> u32 {
+    let s = src.octets();
+    let d = dst.octets();
+    u32::from(u16::from_be_bytes([s[0], s[1]]))
+        + u32::from(u16::from_be_bytes([s[2], s[3]]))
+        + u32::from(u16::from_be_bytes([d[0], d[1]]))
+        + u32::from(u16::from_be_bytes([d[2], d[3]]))
+        + u32::from(proto)
+        + u32::from(len)
+}
+
+/// Pseudo-header sum for IPv6 UDP/TCP/ICMPv6 checksums.
+#[must_use]
+pub fn pseudo_v6(src: Ipv6Addr, dst: Ipv6Addr, proto: u8, len: u16) -> u32 {
+    let mut sum = u32::from(proto) + u32::from(len);
+    for seg in src.segments().into_iter().chain(dst.segments()) {
+        sum += u32::from(seg);
+    }
+    sum
+}
+
 /// RFC 1071 internet checksum over `data` with an initial sum (for
 /// pseudo-headers). Only used when checksum offload is unavailable.
 #[must_use]
@@ -66,6 +221,46 @@ mod tests {
         // Example from RFC 1071 section 3.
         let data = [0x00u8, 0x01, 0xf2, 0x03, 0xf4, 0xf5, 0xf6, 0xf7];
         assert_eq!(checksum(&data, 0), !0xddf2);
+    }
+
+    #[test]
+    fn udp_checksum_matches_known_packet() {
+        // DNS query 169.254.1.2:40000 -> 169.254.1.1:53, payload "hi".
+        let src = Ipv4Addr::new(169, 254, 1, 2);
+        let dst = Ipv4Addr::new(169, 254, 1, 1);
+        let mut dgram = vec![0u8; UDP_HDR_LEN + 2];
+        dgram[UDP_HDR_LEN..].copy_from_slice(b"hi");
+        let len = u16::try_from(dgram.len()).unwrap();
+        UdpHdr::write(&mut dgram, 40000, 53, pseudo_v4(src, dst, IPPROTO_UDP, len));
+        // Verifying the checksum over pseudo header + datagram yields 0.
+        assert_eq!(checksum(&dgram, pseudo_v4(src, dst, IPPROTO_UDP, len)), 0);
+    }
+
+    #[test]
+    fn ipv6_roundtrip() {
+        let mut b = [0u8; IPV6_HDR_LEN];
+        let src = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
+        let dst = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2);
+        Ipv6Hdr::write(&mut b, src, dst, IPPROTO_UDP, 100);
+        let h = Ipv6Hdr::parse(&b).unwrap();
+        assert_eq!(h.src, src);
+        assert_eq!(h.dst, dst);
+        assert_eq!(h.next_header, IPPROTO_UDP);
+        assert_eq!(h.payload_len, 100);
+    }
+
+    #[test]
+    fn ipv4_roundtrip() {
+        let mut b = [0u8; IPV4_HDR_LEN];
+        let src = Ipv4Addr::new(10, 0, 0, 1);
+        let dst = Ipv4Addr::new(169, 254, 1, 2);
+        Ipv4Hdr::write(&mut b, src, dst, IPPROTO_UDP, 100);
+        let h = Ipv4Hdr::parse(&b).unwrap();
+        assert_eq!(h.src, src);
+        assert_eq!(h.dst, dst);
+        assert_eq!(h.proto, IPPROTO_UDP);
+        assert_eq!(h.total_len, 120);
+        assert_eq!(checksum(&b, 0), 0);
     }
 
     #[test]
