@@ -5,6 +5,23 @@
 //! kernel runs the real TCP stack; presto-pasta only rewrites headers and
 //! moves payload. The caller owns the network namespace and the tap
 //! device configuration. See DESIGN.md.
+//!
+//! ```no_run
+//! # fn tap_fd_from_sandbox() -> std::os::fd::OwnedFd { unimplemented!() }
+//! // The caller created the sandbox netns and opened the tap inside it
+//! // with IFF_TAP | IFF_NO_PI | IFF_VNET_HDR (see tests/netns.rs for a
+//! // complete setup).
+//! let tap_fd = tap_fd_from_sandbox();
+//! let cfg = presto_pasta::Config {
+//!     // Internet only: no host LANs, VPN subnets or link-local services.
+//!     // Without a callback the default policy refuses loopback destinations.
+//!     allow_flow: Some(std::sync::Arc::new(|dst: &presto_pasta::FlowDst| dst.is_public())),
+//!     ..presto_pasta::Config::default()
+//! };
+//! let mut presto = presto_pasta::Presto::new(cfg, tap_fd);
+//! let liveness = presto.liveness_fd().unwrap(); // POLLHUP when the datapath dies
+//! std::thread::spawn(move || presto.run());
+//! ```
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
