@@ -30,6 +30,9 @@
             clippy
             rustfmt
             rust-analyzer
+            # test harness
+            iproute2
+            util-linux
           ];
         };
       });

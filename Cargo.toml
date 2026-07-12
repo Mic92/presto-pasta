@@ -10,5 +10,8 @@ libc = "0.2"
 nix = { version = "0.31", features = ["net", "socket", "uio", "fs", "ioctl"] }
 io-uring = "0.7"
 
+[dev-dependencies]
+nix = { version = "0.31", features = ["ioctl"] }
+
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
