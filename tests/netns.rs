@@ -146,6 +146,10 @@ fn setup_and_pass_tap() -> OwnedFd {
     let tap_fd = open_tap("eth0").expect("open tap");
 
     ip("link set lo up");
+    // Same MTU pasta configures on its tap: with the default 1500 the
+    // guest's MSS is 1460 and its GSO frames stay well below the 64 KiB
+    // a frame could carry.
+    ip("link set eth0 mtu 65520");
     ip("link set eth0 up");
     ip("addr add 169.254.1.2/16 dev eth0");
     ip("addr add 64:ff9b:1:4b8e:472e:a5c8:a9fe:102/112 dev eth0 nodad");
@@ -302,7 +306,19 @@ fn iperf3_client(label: &str) {
 /// Bench sandbox namespace: configure the tap, then measure with iperf3.
 fn bench_sandbox() -> ! {
     let _tap_fd = setup_and_pass_tap();
+    // Optional debug capture of the guest side of the tap (headers
+    // only), enabled by pointing PRESTO_BENCH_PCAP at the output file.
+    let mut tcpdump = std::env::var("PRESTO_BENCH_PCAP").ok().and_then(|path| {
+        Command::new("tcpdump")
+            .args(["-i", "eth0", "-s", "96", "-w", &path])
+            .spawn()
+            .ok()
+    });
     iperf3_client("presto");
+    if let Some(child) = tcpdump.as_mut() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
     exit(0);
 }
 
