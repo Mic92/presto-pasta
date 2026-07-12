@@ -33,6 +33,9 @@
             # test harness
             iproute2
             util-linux
+            # benchmark (tests/netns.rs bench, run with --ignored)
+            iperf3
+            passt
           ];
         };
       });

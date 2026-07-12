@@ -127,12 +127,12 @@ fn ip(args: &str) {
     assert!(status.success(), "ip {args} failed");
 }
 
-fn reexec_unshared(role: &str, extra_env: &[(&str, String)]) -> Command {
+fn reexec_unshared(role: &str, test: &str, extra_env: &[(&str, String)]) -> Command {
     let exe = std::env::current_exe().unwrap();
     let mut cmd = Command::new("unshare");
     cmd.args(["--user", "--map-root-user", "--net", "--"])
         .arg(exe)
-        .args(["--exact", "datapath"])
+        .args(["--exact", test, "--include-ignored", "--nocapture"])
         .env(ROLE, role);
     for (k, v) in extra_env {
         cmd.env(k, v);
@@ -140,12 +140,11 @@ fn reexec_unshared(role: &str, extra_env: &[(&str, String)]) -> Command {
     cmd
 }
 
-/// Sandbox namespace: open + configure the tap, hand the fd to the host
-/// side, then exercise UDP through presto.
-fn sandbox() -> ! {
+/// Configure the tap the way a sandbox runner would before handing the
+/// fd to presto, and pass it to the host side over the unix socket.
+fn setup_and_pass_tap() -> OwnedFd {
     let tap_fd = open_tap("eth0").expect("open tap");
 
-    // Same setup a sandbox runner performs before handing the fd to presto.
     ip("link set lo up");
     ip("link set eth0 up");
     ip("addr add 169.254.1.2/16 dev eth0");
@@ -156,7 +155,6 @@ fn sandbox() -> ! {
     ip(
         "neigh add 64:ff9b:1:4b8e:472e:a5c8:a9fe:101 lladdr 9a:55:9a:55:9a:55 dev eth0 nud permanent",
     );
-    allow_ping_sockets();
 
     let pass_fd: RawFd = std::env::var(PASS_FD).unwrap().parse().unwrap();
     let pass = unsafe { BorrowedFd::borrow_raw(pass_fd) };
@@ -171,6 +169,48 @@ fn sandbox() -> ! {
     .expect("send tap fd");
     // Keep tap_fd open: closing the last attached queue would drop the
     // interface carrier and with it the routes.
+    tap_fd
+}
+
+/// Spawn the sandbox role, receive the tap fd it configured, and start
+/// presto on it. Returns the sandbox child to wait on.
+fn spawn_sandbox_with_presto(role: &str, test: &str) -> std::process::Child {
+    let (ours, theirs) = socketpair(
+        AddressFamily::Unix,
+        SockType::Datagram,
+        None,
+        SockFlag::empty(),
+    )
+    .expect("socketpair");
+    let child = reexec_unshared(role, test, &[(PASS_FD, theirs.as_raw_fd().to_string())])
+        .spawn()
+        .expect("spawn sandbox");
+
+    let mut cmsg = nix::cmsg_space!([RawFd; 1]);
+    let mut data = [0u8; 8];
+    let mut iov = [io::IoSliceMut::new(&mut data)];
+    let msg = recvmsg::<()>(
+        ours.as_raw_fd(),
+        &mut iov,
+        Some(&mut cmsg),
+        MsgFlags::empty(),
+    )
+    .expect("recv tap fd");
+    let tap_fd = match msg.cmsgs().expect("cmsgs").next() {
+        Some(ControlMessageOwned::ScmRights(fds)) => unsafe { OwnedFd::from_raw_fd(fds[0]) },
+        other => panic!("expected SCM_RIGHTS, got {other:?}"),
+    };
+
+    let presto = presto::Presto::new(presto::Config::default(), tap_fd);
+    std::thread::spawn(move || presto.run().expect("presto run"));
+    child
+}
+
+/// Sandbox namespace: open + configure the tap, hand the fd to the host
+/// side, then exercise UDP through presto.
+fn sandbox() -> ! {
+    allow_ping_sockets();
+    let _tap_fd = setup_and_pass_tap();
 
     for target in ["10.0.0.1:7777", "[fd00::1]:7777"] {
         let bind = if target.starts_with('[') {
@@ -240,37 +280,93 @@ fn host() -> ! {
         });
     }
 
-    let (ours, theirs) = socketpair(
-        AddressFamily::Unix,
-        SockType::Datagram,
-        None,
-        SockFlag::empty(),
-    )
-    .expect("socketpair");
-    let mut child = reexec_unshared("sandbox", &[(PASS_FD, theirs.as_raw_fd().to_string())])
-        .spawn()
-        .expect("spawn sandbox");
-
-    let mut cmsg = nix::cmsg_space!([RawFd; 1]);
-    let mut data = [0u8; 8];
-    let mut iov = [io::IoSliceMut::new(&mut data)];
-    let msg = recvmsg::<()>(
-        ours.as_raw_fd(),
-        &mut iov,
-        Some(&mut cmsg),
-        MsgFlags::empty(),
-    )
-    .expect("recv tap fd");
-    let tap_fd = match msg.cmsgs().expect("cmsgs").next() {
-        Some(ControlMessageOwned::ScmRights(fds)) => unsafe { OwnedFd::from_raw_fd(fds[0]) },
-        other => panic!("expected SCM_RIGHTS, got {other:?}"),
-    };
-
-    let presto = presto::Presto::new(presto::Config::default(), tap_fd);
-    std::thread::spawn(move || presto.run().expect("presto run"));
-
+    let mut child = spawn_sandbox_with_presto("sandbox", "datapath");
     let status = child.wait().expect("wait sandbox");
     exit(i32::from(!status.success()));
+}
+
+/// Run the iperf3 client against the host-side server, once in each
+/// direction, labelling the output.
+fn iperf3_client(label: &str) {
+    for (dir, extra) in [("upload", &[][..]), ("download", &["-R"][..])] {
+        println!("=== {label} {dir} ===");
+        let status = Command::new("iperf3")
+            .args(["-c", "10.0.0.1", "-t", "5", "-f", "g"])
+            .args(extra)
+            .status()
+            .expect("run iperf3 client");
+        assert!(status.success(), "iperf3 {label} {dir} failed");
+    }
+}
+
+/// Bench sandbox namespace: configure the tap, then measure with iperf3.
+fn bench_sandbox() -> ! {
+    let _tap_fd = setup_and_pass_tap();
+    iperf3_client("presto");
+    exit(0);
+}
+
+/// Bench host namespace: iperf3 server plus presto, then the same
+/// measurement through pasta attached to its own namespace.
+fn bench_host() -> ! {
+    ip("link set lo up");
+    ip("addr add 10.0.0.1/32 dev lo");
+
+    let mut server = Command::new("iperf3")
+        .args(["-s", "-B", "10.0.0.1"])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("start iperf3 server");
+
+    let mut child = spawn_sandbox_with_presto("bench-sandbox", "bench");
+    let presto_ok = child.wait().expect("wait bench sandbox").success();
+
+    // Same measurement through pasta, invoked the way sandbox runners
+    // do (private netns, no port forwarding).
+    let pasta_ok = Command::new("pasta")
+        .args([
+            "--config-net",
+            "--quiet",
+            "-t",
+            "none",
+            "-u",
+            "none",
+            "-T",
+            "none",
+            "-U",
+            "none",
+            "--",
+        ])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", "bench", "--include-ignored", "--nocapture"])
+        .env(ROLE, "bench-pasta")
+        .status()
+        .expect("run pasta")
+        .success();
+
+    let _ = server.kill();
+    let _ = server.wait();
+    exit(i32::from(!(presto_ok && pasta_ok)));
+}
+
+/// Throughput comparison against pasta; needs iperf3 and pasta in
+/// PATH. Run with `cargo test --release -- --ignored --nocapture bench`.
+#[test]
+#[ignore = "benchmark, run explicitly"]
+fn bench() {
+    match std::env::var(ROLE).as_deref() {
+        Ok("bench-host") => bench_host(),
+        Ok("bench-sandbox") => bench_sandbox(),
+        Ok("bench-pasta") => {
+            iperf3_client("pasta");
+            exit(0);
+        }
+        _ => {}
+    }
+    let status = reexec_unshared("bench-host", "bench", &[])
+        .status()
+        .expect("unshare");
+    assert!(status.success(), "bench run failed");
 }
 
 #[test]
@@ -280,7 +376,7 @@ fn datapath() {
         Ok("sandbox") => sandbox(),
         _ => {}
     }
-    let output = match reexec_unshared("host", &[]).output() {
+    let output = match reexec_unshared("host", "datapath", &[]).output() {
         Ok(o) => o,
         Err(e) => {
             eprintln!("skipping: unshare unavailable: {e}");
