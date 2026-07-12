@@ -1,9 +1,13 @@
 [package]
 name = "presto-pasta"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 license = "MIT"
 description = "User-mode NAT datapath for sandboxes: L2 tap to native host sockets"
+repository = "https://github.com/Mic92/presto-pasta"
+readme = "README.md"
+keywords = ["sandbox", "networking", "nat", "pasta", "io-uring"]
+categories = ["network-programming", "virtualization"]
 
 [dependencies]
 libc = "0.2"
