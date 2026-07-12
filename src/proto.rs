@@ -24,7 +24,9 @@ pub const TCP_ACK: u8 = 0x10;
 
 pub const ICMP_HDR_LEN: usize = 8;
 pub const ICMP_ECHO_REQUEST: u8 = 8;
+pub const ICMP_ECHO_REPLY: u8 = 0;
 pub const ICMPV6_ECHO_REQUEST: u8 = 128;
+pub const ICMPV6_ECHO_REPLY: u8 = 129;
 
 /// Ethernet header of a frame (after the vnet header).
 #[derive(Debug, Clone, Copy)]

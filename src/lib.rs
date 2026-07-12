@@ -24,7 +24,7 @@
 //! ```
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
@@ -107,6 +107,28 @@ pub struct Config {
     /// by presto-pasta itself and is filtered on the gateway address,
     /// not on the host resolver's.
     pub allow_flow: Option<FlowFilter>,
+    /// NAT64 /96 prefix for IPv6-only hosts (CLAT-style). When set,
+    /// IPv4 destinations from the guest are embedded into this prefix
+    /// (RFC 6052) and the host sockets use IPv6; the guest keeps
+    /// speaking plain IPv4. The well-known prefix is `64:ff9b::`.
+    /// [`Config::allow_flow`] still sees the guest's IPv4 destination.
+    pub nat64_prefix: Option<Ipv6Addr>,
+}
+
+impl Config {
+    /// Destination the host socket should connect to: `dst` itself,
+    /// or its IPv4 address embedded into [`Config::nat64_prefix`].
+    #[must_use]
+    pub fn nat64_target(&self, dst: SocketAddr) -> SocketAddr {
+        match (self.nat64_prefix, dst.ip()) {
+            (Some(prefix), IpAddr::V4(v4)) => {
+                let mut octets = prefix.octets();
+                octets[12..16].copy_from_slice(&v4.octets());
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), dst.port())
+            }
+            _ => dst,
+        }
+    }
 }
 
 impl Default for Config {
@@ -120,6 +142,7 @@ impl Default for Config {
             dns_forward: true,
             buffers: 64,
             allow_flow: None,
+            nat64_prefix: None,
         }
     }
 }
@@ -177,7 +200,7 @@ impl Presto {
 
 #[cfg(test)]
 mod tests {
-    use super::FlowDst;
+    use super::{Config, FlowDst};
 
     fn dst(ip: &str) -> FlowDst {
         FlowDst {
@@ -185,6 +208,24 @@ mod tests {
             ip: ip.parse().unwrap(),
             port: 443,
         }
+    }
+
+    #[test]
+    fn nat64_target_embeds_v4_into_prefix() {
+        let cfg = Config {
+            nat64_prefix: Some("64:ff9b::".parse().unwrap()),
+            ..Config::default()
+        };
+        assert_eq!(
+            cfg.nat64_target("10.0.0.1:7878".parse().unwrap()),
+            "[64:ff9b::a00:1]:7878".parse().unwrap()
+        );
+        // IPv6 destinations and unconfigured prefixes pass through.
+        let v6: std::net::SocketAddr = "[fd00::1]:53".parse().unwrap();
+        assert_eq!(cfg.nat64_target(v6), v6);
+        let off = Config::default();
+        let v4: std::net::SocketAddr = "10.0.0.1:80".parse().unwrap();
+        assert_eq!(off.nat64_target(v4), v4);
     }
 
     #[test]
