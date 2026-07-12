@@ -2,6 +2,9 @@
 
 A user-mode NAT datapath for sandboxes, as a Rust library.
 
+[![crates.io](https://img.shields.io/crates/v/presto-pasta.svg)](https://crates.io/crates/presto-pasta)
+[![docs.rs](https://img.shields.io/docsrs/presto-pasta)](https://docs.rs/presto-pasta)
+
 Build systems and sandbox runners give each job its own network
 namespace because sharing the host's namespace exposes localhost
 services, link-local addresses and abstract unix sockets (which ignore
@@ -40,6 +43,12 @@ lifetime of the job. presto-pasta avoids that:
   io_uring op allowlist confine the datapath thread.
 
 ## What the caller does
+
+Add the crate:
+
+```console
+cargo add presto-pasta
+```
 
 The caller owns the sandbox: create the user+net namespace, open the
 tap inside it (`IFF_TAP | IFF_NO_PI | IFF_VNET_HDR`), assign
