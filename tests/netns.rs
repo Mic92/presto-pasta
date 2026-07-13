@@ -11,6 +11,7 @@
 
 mod common;
 
+use std::io;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::process::{Command, exit};
@@ -507,6 +508,75 @@ fn datapath() {
         _ => {}
     }
     run_in_userns("host", "datapath", &[]);
+}
+
+/// Host namespace for the unreachable test: addresses only, no
+/// services, so every guest datagram hits a closed port.
+fn unreachable_host() -> ! {
+    ip("link set lo up");
+    ip("addr add 10.0.0.1/32 dev lo");
+    ip("addr add fd00::1/128 dev lo nodad");
+    let mut child = spawn_sandbox_with_presto(
+        "unreachable-sandbox",
+        "udp_unreachable",
+        presto_pasta::Config::default(),
+    );
+    let status = child.wait().expect("wait sandbox");
+    exit(i32::from(!status.success()));
+}
+
+/// Sandbox namespace: UDP to a closed port must surface ECONNREFUSED
+/// on the connected socket, i.e. the datapath has to translate the
+/// host-side ICMP error into a port unreachable towards the guest.
+fn unreachable_sandbox() -> ! {
+    let _tap_fd = setup_and_pass_tap();
+
+    for target in ["10.0.0.1:7000", "[fd00::1]:7000"] {
+        let bind = if target.starts_with('[') {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let sock = UdpSocket::bind(bind).expect("bind in sandbox");
+        sock.connect(target).expect("connect");
+        sock.set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let mut refused = false;
+        let mut reply = [0u8; 16];
+        for _ in 0..20 {
+            if let Err(e) = sock.send(b"nobody-home") {
+                assert_eq!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionRefused,
+                    "unexpected send error for {target}"
+                );
+                refused = true;
+                break;
+            }
+            match sock.recv(&mut reply) {
+                Ok(_) => panic!("unexpected reply from closed port {target}"),
+                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                    refused = true;
+                    break;
+                }
+                Err(_) => {}
+            }
+        }
+        assert!(refused, "no port unreachable from {target}");
+    }
+    exit(0);
+}
+
+/// UDP to a closed port is refused instead of timing out; found by the
+/// differential fuzz test.
+#[test]
+fn udp_unreachable() {
+    match std::env::var(ROLE).as_deref() {
+        Ok("unreachable-host") => unreachable_host(),
+        Ok("unreachable-sandbox") => unreachable_sandbox(),
+        _ => {}
+    }
+    run_in_userns("unreachable-host", "udp_unreachable", &[]);
 }
 
 /// Host namespace for the NAT64 test: services listen only on an IPv6

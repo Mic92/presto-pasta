@@ -210,6 +210,8 @@ impl EventLoop {
                             } else {
                                 self.reply_to_guest(id, len, None);
                             }
+                        } else if f.kind == flow::FlowKind::Udp {
+                            self.udp_error_to_guest(id, -res);
                         }
                         self.submit_flow_recv(id)?;
                     }
@@ -566,8 +568,6 @@ impl EventLoop {
         let key = f.key;
         let kind = f.kind;
         let buf_id = f.buf;
-        let guest_mac = self.guest_mac;
-        let gateway_mac = self.cfg.gateway_mac;
         let (guest4, guest6) = (self.cfg.guest4, self.cfg.guest6);
         let end = buf::HEADROOM + len;
 
@@ -591,7 +591,6 @@ impl EventLoop {
             IpAddr::V6(_) => l4_start - proto::IPV6_HDR_LEN,
         };
         let eth_start = ip_start - proto::ETH_LEN;
-        let vnet_start = eth_start - tap::VNET_HDR_LEN;
 
         let b = self.pool.get_mut(buf_id);
         match kind {
@@ -619,24 +618,6 @@ impl EventLoop {
             }
             flow::FlowKind::Tcp => return,
         }
-        match key.dst.ip() {
-            IpAddr::V4(src) => {
-                proto::Ipv4Hdr::write(&mut b[ip_start..], src, guest4, ip_proto, l4_len);
-            }
-            IpAddr::V6(src) => {
-                proto::Ipv6Hdr::write(&mut b[ip_start..], src, guest6, ip_proto, l4_len);
-            }
-        }
-        proto::EthHdr {
-            dst: guest_mac,
-            src: gateway_mac,
-            ethertype: if key.dst.is_ipv4() {
-                proto::ETHERTYPE_IPV4
-            } else {
-                proto::ETHERTYPE_IPV6
-            },
-        }
-        .write(&mut b[eth_start..]);
         let vnet = match gso_size {
             Some(gso) => tap::VnetHdr {
                 flags: tap::VIRTIO_NET_HDR_F_NEEDS_CSUM,
@@ -648,10 +629,125 @@ impl EventLoop {
             },
             None => tap::VnetHdr::default(),
         };
+        self.frame_to_guest(buf_id, key.dst.ip(), ip_proto, l4_start, end, &vnet);
+    }
+
+    /// Wrap the L4 message at `l4_start..end` of `buf_id` in IP,
+    /// ethernet and vnet headers (source `src_ip`, destination the
+    /// guest) and write the frame to the tap.
+    fn frame_to_guest(
+        &mut self,
+        buf_id: buf::BufId,
+        src_ip: IpAddr,
+        ip_proto: u8,
+        l4_start: usize,
+        end: usize,
+        vnet: &tap::VnetHdr,
+    ) {
+        let (guest4, guest6) = (self.cfg.guest4, self.cfg.guest6);
+        let l4_len = u16::try_from(end - l4_start).unwrap_or(u16::MAX);
+        let ip_start = match src_ip {
+            IpAddr::V4(_) => l4_start - proto::IPV4_HDR_LEN,
+            IpAddr::V6(_) => l4_start - proto::IPV6_HDR_LEN,
+        };
+        let eth_start = ip_start - proto::ETH_LEN;
+        let vnet_start = eth_start - tap::VNET_HDR_LEN;
+
+        let b = self.pool.get_mut(buf_id);
+        match src_ip {
+            IpAddr::V4(src) => {
+                proto::Ipv4Hdr::write(&mut b[ip_start..], src, guest4, ip_proto, l4_len);
+            }
+            IpAddr::V6(src) => {
+                proto::Ipv6Hdr::write(&mut b[ip_start..], src, guest6, ip_proto, l4_len);
+            }
+        }
+        proto::EthHdr {
+            dst: self.guest_mac,
+            src: self.cfg.gateway_mac,
+            ethertype: if src_ip.is_ipv4() {
+                proto::ETHERTYPE_IPV4
+            } else {
+                proto::ETHERTYPE_IPV6
+            },
+        }
+        .write(&mut b[eth_start..]);
         b[vnet_start..eth_start].copy_from_slice(&vnet.to_bytes());
 
         self.stats.tap_out(end - vnet_start);
         let _ = nix::unistd::write(self.tap.fd(), &b[vnet_start..end]);
+    }
+
+    /// Translate a host socket error on a UDP flow (delivered by ICMP
+    /// to the connected socket) into an ICMP/ICMPv6 destination
+    /// unreachable towards the guest, so guest sockets see e.g.
+    /// ECONNREFUSED for closed ports just like on a kernel path. The
+    /// embedded offending packet is reconstructed from the flow key
+    /// (the original datagram is gone by the time the error surfaces),
+    /// which is enough for the guest kernel to match it to the socket.
+    fn udp_error_to_guest(&mut self, id: usize, errno: i32) {
+        // v4 / v6 code per RFC 792 and RFC 4443.
+        let (code4, code6) = match errno {
+            libc::ECONNREFUSED => (3, 4), // port unreachable
+            libc::EHOSTUNREACH => (1, 3), // host / address unreachable
+            libc::ENETUNREACH => (0, 0),  // net unreachable / no route
+            _ => return,
+        };
+        let Some(f) = self.flows.get_mut(id) else {
+            return;
+        };
+        f.last_active = Instant::now();
+        let key = f.key;
+        let buf_id = f.buf;
+        let (guest4, guest6) = (self.cfg.guest4, self.cfg.guest6);
+        let udp_len = u16::try_from(proto::UDP_HDR_LEN).expect("header length");
+
+        // ICMP message layout: 8-byte unreachable header, then the
+        // reconstructed IP + UDP header of the guest's datagram.
+        let l4_start = buf::HEADROOM;
+        let embedded = l4_start + proto::ICMP_HDR_LEN;
+        let b = self.pool.get_mut(buf_id);
+        let (ip_len, ip_proto, icmp_type, code, embedded_pseudo) = match key.dst.ip() {
+            IpAddr::V4(dst) => {
+                proto::Ipv4Hdr::write(&mut b[embedded..], guest4, dst, proto::IPPROTO_UDP, udp_len);
+                (
+                    proto::IPV4_HDR_LEN,
+                    proto::IPPROTO_ICMP,
+                    proto::ICMP_DEST_UNREACH,
+                    code4,
+                    proto::pseudo_v4(guest4, dst, proto::IPPROTO_UDP, udp_len),
+                )
+            }
+            IpAddr::V6(dst) => {
+                proto::Ipv6Hdr::write(&mut b[embedded..], guest6, dst, proto::IPPROTO_UDP, udp_len);
+                (
+                    proto::IPV6_HDR_LEN,
+                    proto::IPPROTO_ICMPV6,
+                    proto::ICMPV6_DEST_UNREACH,
+                    code6,
+                    proto::pseudo_v6(guest6, dst, proto::IPPROTO_UDP, udp_len),
+                )
+            }
+        };
+        let end = embedded + ip_len + proto::UDP_HDR_LEN;
+        proto::UdpHdr::write(
+            &mut b[end - proto::UDP_HDR_LEN..end],
+            key.guest_port,
+            key.dst.port(),
+            embedded_pseudo,
+            false,
+        );
+        // ICMPv4 checksums have no pseudo-header.
+        let pseudo = match key.dst.ip() {
+            IpAddr::V4(_) => 0,
+            IpAddr::V6(src) => {
+                let l4_len = u16::try_from(end - l4_start).unwrap_or(u16::MAX);
+                proto::pseudo_v6(src, guest6, ip_proto, l4_len)
+            }
+        };
+        proto::write_unreachable(&mut b[l4_start..end], icmp_type, code, pseudo);
+        let vnet = tap::VnetHdr::default();
+        self.frame_to_guest(buf_id, key.dst.ip(), ip_proto, l4_start, end, &vnet);
     }
 
     fn handle_tcp(&mut self, g: &GuestFrame) {
