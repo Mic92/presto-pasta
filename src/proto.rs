@@ -25,8 +25,10 @@ pub const TCP_ACK: u8 = 0x10;
 pub const ICMP_HDR_LEN: usize = 8;
 pub const ICMP_ECHO_REQUEST: u8 = 8;
 pub const ICMP_ECHO_REPLY: u8 = 0;
+pub const ICMP_DEST_UNREACH: u8 = 3;
 pub const ICMPV6_ECHO_REQUEST: u8 = 128;
 pub const ICMPV6_ECHO_REPLY: u8 = 129;
+pub const ICMPV6_DEST_UNREACH: u8 = 1;
 
 /// Ethernet header of a frame (after the vnet header).
 #[derive(Debug, Clone, Copy)]
@@ -169,6 +171,17 @@ impl IcmpEcho {
         let csum = checksum(msg, pseudo);
         msg[2..4].copy_from_slice(&csum.to_be_bytes());
     }
+}
+
+/// Write the 8-byte ICMP/ICMPv6 destination-unreachable header in
+/// front of the already-filled excerpt of the offending packet and
+/// checksum the whole message. `pseudo` is zero for `ICMPv4`.
+pub fn write_unreachable(msg: &mut [u8], icmp_type: u8, code: u8, pseudo: u32) {
+    msg[..ICMP_HDR_LEN].fill(0);
+    msg[0] = icmp_type;
+    msg[1] = code;
+    let csum = checksum(msg, pseudo);
+    msg[2..4].copy_from_slice(&csum.to_be_bytes());
 }
 
 /// TCP header view. Only the MSS and window-scale options are decoded;
