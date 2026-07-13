@@ -471,10 +471,7 @@ fn packet_socket(ifname: &str) -> OwnedFd {
 fn mac_of(ifname: &str) -> [u8; 6] {
     let sock = UdpSocket::bind("0.0.0.0:0").expect("mac probe socket");
     let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
-    #[expect(clippy::cast_possible_wrap, reason = "c_char is i8 on some targets")]
-    for (dst, src) in ifr.ifr_name.iter_mut().zip(ifname.bytes()) {
-        *dst = src as libc::c_char;
-    }
+    common::set_ifr_name(&mut ifr, ifname);
     let rc = unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFHWADDR, &raw mut ifr) };
     assert!(
         rc == 0,
@@ -483,9 +480,9 @@ fn mac_of(ifname: &str) -> [u8; 6] {
     );
     let raw = unsafe { ifr.ifr_ifru.ifru_hwaddr.sa_data };
     let mut mac = [0u8; 6];
-    #[expect(clippy::cast_sign_loss, reason = "c_char is i8 on some targets")]
+    // c_char signedness differs across targets; convert per byte.
     for (dst, src) in mac.iter_mut().zip(raw) {
-        *dst = src as u8;
+        *dst = u8::from_ne_bytes(src.to_ne_bytes());
     }
     mac
 }
