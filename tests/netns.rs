@@ -9,56 +9,22 @@
 //! passes the fd to the host side over a unix socketpair. This doubles
 //! as the reference for integrating presto-pasta into a sandbox runner.
 
-use std::io;
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::process::{Command, exit};
 use std::time::Duration;
 
-use nix::sys::socket::{
-    AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag, SockProtocol, SockType,
-    recvmsg, sendmsg, socket, socketpair,
+use common::{
+    ROLE, allow_ping_sockets, connect_with_retry, ip, ping, reexec_unshared, run_in_userns,
+    setup_and_pass_tap, spawn_sandbox_and_recv_tap,
 };
-
-const ROLE: &str = "PRESTO_ROLE";
-const PASS_FD: &str = "PRESTO_PASS_FD";
-
-// linux/if_tun.h
-const IFF_TAP: i16 = 0x0002;
-const IFF_NO_PI: i16 = 0x1000;
-const IFF_VNET_HDR: i16 = 0x4000;
-
-nix::ioctl_write_ptr_bad!(
-    tun_set_iff,
-    nix::request_code_write!(b'T', 202, std::mem::size_of::<libc::c_int>()),
-    libc::ifreq
-);
-
-fn open_tap(name: &str) -> io::Result<OwnedFd> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/net/tun")?;
-    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
-    #[allow(clippy::cast_possible_wrap, reason = "c_char is i8 on some targets")]
-    for (dst, src) in ifr.ifr_name.iter_mut().zip(name.bytes()) {
-        *dst = src as libc::c_char;
-    }
-    ifr.ifr_ifru.ifru_flags = IFF_TAP | IFF_NO_PI | IFF_VNET_HDR;
-    unsafe { tun_set_iff(file.as_raw_fd(), &raw const ifr) }.map_err(io::Error::from)?;
-    Ok(OwnedFd::from(file))
-}
-
-fn allow_ping_sockets() {
-    // Only gid 0 is mapped in the user namespace; wider ranges are
-    // rejected with EINVAL.
-    std::fs::write("/proc/sys/net/ipv4/ping_group_range", "0 0").expect("enable ping sockets");
-}
 
 /// Bulk TCP echo through presto-pasta: connect, stream 1 MiB, read it back.
 fn tcp_echo(target: &str) {
-    let mut stream = connect_with_retry(target);
+    let mut stream =
+        connect_with_retry(target).unwrap_or_else(|e| panic!("connect to {target}: {e}"));
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
@@ -83,45 +49,6 @@ fn tcp_echo(target: &str) {
     assert_eq!(echoed, payload, "echo content from {target}");
 }
 
-/// Connect through presto-pasta, retrying while it is still starting up.
-fn connect_with_retry(target: &str) -> TcpStream {
-    for _ in 0..20 {
-        if let Ok(s) = TcpStream::connect(target) {
-            return s;
-        }
-        std::thread::sleep(Duration::from_millis(300));
-    }
-    panic!("connect to {target}");
-}
-
-/// Send one ICMP echo request over an unprivileged ping socket and wait
-/// for the reply.
-fn ping(dst: &str) -> bool {
-    let v4 = !dst.contains(':');
-    let (family, proto) = if v4 {
-        (AddressFamily::Inet, SockProtocol::Icmp)
-    } else {
-        (AddressFamily::Inet6, SockProtocol::IcmpV6)
-    };
-    let fd =
-        socket(family, SockType::Datagram, SockFlag::SOCK_CLOEXEC, proto).expect("ping socket");
-    let sock = UdpSocket::from(fd);
-    sock.connect((dst, 0)).expect("connect ping socket");
-    sock.set_read_timeout(Some(Duration::from_millis(300)))
-        .unwrap();
-    let echo_request = if v4 { 8u8 } else { 128 };
-    // type, code, checksum (kernel), id (kernel), seq 1, payload
-    let req = [echo_request, 0, 0, 0, 0, 0, 0, 1, 0xaa, 0xbb];
-    let mut reply = [0u8; 64];
-    for _ in 0..20 {
-        sock.send(&req).expect("send echo request");
-        if let Ok(n) = sock.recv(&mut reply) {
-            return n == req.len() && reply[8..10] == [0xaa, 0xbb];
-        }
-    }
-    false
-}
-
 /// Run `nft`, returning whether it succeeded (the binary or the
 /// netfilter modules may be unavailable).
 fn nft(args: &[&str]) -> bool {
@@ -136,52 +63,6 @@ fn pattern(i: usize) -> u8 {
     u8::try_from(i % 251).expect("remainder fits u8")
 }
 
-fn ip(args: &str) {
-    let status = Command::new("ip")
-        .args(args.split_whitespace())
-        .status()
-        .expect("run ip");
-    assert!(status.success(), "ip {args} failed");
-}
-
-fn reexec_unshared(role: &str, test: &str, extra_env: &[(&str, String)]) -> Command {
-    let exe = std::env::current_exe().unwrap();
-    let mut cmd = Command::new("unshare");
-    cmd.args(["--user", "--map-root-user", "--net", "--"])
-        .arg(exe)
-        .args(["--exact", test, "--include-ignored", "--nocapture"])
-        .env(ROLE, role);
-    for (k, v) in extra_env {
-        cmd.env(k, v);
-    }
-    cmd
-}
-
-/// Configure the tap the way a sandbox runner would before handing the
-/// fd to presto-pasta, and pass it to the host side over the unix socket.
-fn setup_and_pass_tap() -> OwnedFd {
-    let tap_fd = open_tap("eth0").expect("open tap");
-
-    ip("link set lo up");
-    presto_pasta::netdev::configure("eth0", &presto_pasta::Config::default())
-        .expect("configure eth0");
-
-    let pass_fd: RawFd = std::env::var(PASS_FD).unwrap().parse().unwrap();
-    let pass = unsafe { BorrowedFd::borrow_raw(pass_fd) };
-    let fds = [tap_fd.as_raw_fd()];
-    sendmsg::<()>(
-        pass.as_raw_fd(),
-        &[io::IoSlice::new(b"tap")],
-        &[ControlMessage::ScmRights(&fds)],
-        MsgFlags::empty(),
-        None,
-    )
-    .expect("send tap fd");
-    // Keep tap_fd open: closing the last attached queue would drop the
-    // interface carrier and with it the routes.
-    tap_fd
-}
-
 /// Spawn the sandbox role, receive the tap fd it configured, and start
 /// presto-pasta on it. Returns the sandbox child to wait on.
 fn spawn_sandbox_with_presto(
@@ -189,31 +70,7 @@ fn spawn_sandbox_with_presto(
     test: &str,
     cfg: presto_pasta::Config,
 ) -> std::process::Child {
-    let (ours, theirs) = socketpair(
-        AddressFamily::Unix,
-        SockType::Datagram,
-        None,
-        SockFlag::empty(),
-    )
-    .expect("socketpair");
-    let child = reexec_unshared(role, test, &[(PASS_FD, theirs.as_raw_fd().to_string())])
-        .spawn()
-        .expect("spawn sandbox");
-
-    let mut cmsg = nix::cmsg_space!([RawFd; 1]);
-    let mut data = [0u8; 8];
-    let mut iov = [io::IoSliceMut::new(&mut data)];
-    let msg = recvmsg::<()>(
-        ours.as_raw_fd(),
-        &mut iov,
-        Some(&mut cmsg),
-        MsgFlags::empty(),
-    )
-    .expect("recv tap fd");
-    let tap_fd = match msg.cmsgs().expect("cmsgs").next() {
-        Some(ControlMessageOwned::ScmRights(fds)) => unsafe { OwnedFd::from_raw_fd(fds[0]) },
-        other => panic!("expected SCM_RIGHTS, got {other:?}"),
-    };
+    let (child, tap_fd) = spawn_sandbox_and_recv_tap(role, test, &[]);
 
     let presto = presto_pasta::Presto::new(cfg, tap_fd);
     let datapath_cpu = bench_cpus().map(|c| c[1].clone());
@@ -572,7 +429,7 @@ fn loss_sandbox() -> ! {
         eprintln!("skipping: nftables unavailable");
         exit(0);
     }
-    let mut stream = connect_with_retry("10.0.0.1:7979");
+    let mut stream = connect_with_retry("10.0.0.1:7979").expect("connect loss stream");
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();
@@ -619,7 +476,7 @@ fn lossy_download() {
         Ok("loss-sandbox") => loss_sandbox(),
         _ => {}
     }
-    run_in_userns("loss-host", "lossy_download");
+    run_in_userns("loss-host", "lossy_download", &[]);
 }
 
 /// Throughput comparison against pasta; needs iperf3 and pasta in
@@ -642,31 +499,6 @@ fn bench() {
     assert!(status.success(), "bench run failed");
 }
 
-/// Re-run this test binary as `role` in a fresh user+net namespace and
-/// fail on any child error; skipped where user namespaces are not
-/// available.
-fn run_in_userns(role: &str, test: &str) {
-    let output = match reexec_unshared(role, test, &[]).output() {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("skipping: unshare unavailable: {e}");
-            return;
-        }
-    };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("Operation not permitted") {
-            eprintln!("skipping: user namespaces not permitted");
-            return;
-        }
-        panic!(
-            "netns child failed: {}\nstdout: {}\nstderr: {stderr}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-        );
-    }
-}
-
 #[test]
 fn datapath() {
     match std::env::var(ROLE).as_deref() {
@@ -674,7 +506,7 @@ fn datapath() {
         Ok("sandbox") => sandbox(),
         _ => {}
     }
-    run_in_userns("host", "datapath");
+    run_in_userns("host", "datapath", &[]);
 }
 
 /// Host namespace for the NAT64 test: services listen only on an IPv6
@@ -754,7 +586,7 @@ fn nat64() {
         Ok("nat64-sandbox") => nat64_sandbox(),
         _ => {}
     }
-    run_in_userns("nat64-host", "nat64");
+    run_in_userns("nat64-host", "nat64", &[]);
 }
 
 /// Host namespace for the flow filter test: echo services on 10.0.0.1,
@@ -821,5 +653,5 @@ fn flow_filter() {
         Ok("filter-sandbox") => filter_sandbox(),
         _ => {}
     }
-    run_in_userns("filter-host", "flow_filter");
+    run_in_userns("filter-host", "flow_filter", &[]);
 }
