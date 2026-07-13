@@ -55,7 +55,7 @@ guest side of the tap with tcpdump during the bench.
 
 ## Results
 
-AMD EPYC 9654 (idle), Linux 7.1, 2026-07-12, defaults (64 buffers,
+AMD EPYC 9654 (idle), Linux 7.1, 2026-07-12, defaults at the time (64 buffers,
 single thread), tap MTU 65520, `PRESTO_BENCH_CPUS=2,4,6`, 5 s per
 direction, median of 5 runs:
 

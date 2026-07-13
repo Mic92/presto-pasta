@@ -97,9 +97,11 @@ pub struct Config {
     pub gateway_mac: [u8; 6],
     /// Forward DNS queries addressed to the gateway to the host resolver.
     pub dns_forward: bool,
-    /// Number of 64k buffers in the pool. The pool is registered with
-    /// `io_uring` and pinned, so it is charged against `RLIMIT_MEMLOCK`
-    /// (commonly 8 MiB); raise the limit before raising this.
+    /// Number of 64k buffers in the pool; each concurrent flow holds
+    /// one, and when the pool runs dry the least-recently-used idle
+    /// UDP/ping flow is evicted. The pool is registered with `io_uring`
+    /// and pinned, so it is charged against `RLIMIT_MEMLOCK` (commonly
+    /// 8 MiB); raise the limit before raising this.
     pub buffers: usize,
     /// Called once per new guest flow with its destination; a `false`
     /// return refuses the flow (the guest sees an unreachable host).
@@ -143,7 +145,7 @@ impl Default for Config {
             gateway6: Ipv6Addr::new(0x64, 0xff9b, 0x1, 0x4b8e, 0x472e, 0xa5c8, 0xa9fe, 0x0101),
             gateway_mac: [0x9a, 0x55, 0x9a, 0x55, 0x9a, 0x55],
             dns_forward: true,
-            buffers: 64,
+            buffers: 96,
             allow_flow: None,
             nat64_prefix: None,
         }

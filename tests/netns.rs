@@ -567,6 +567,74 @@ fn unreachable_sandbox() -> ! {
     exit(0);
 }
 
+/// Host namespace for the flow pressure test: a UDP echo service and
+/// presto-pasta with the default buffer pool.
+fn pressure_host() -> ! {
+    ip("link set lo up");
+    ip("addr add 10.0.0.1/32 dev lo");
+    let echo = UdpSocket::bind("10.0.0.1:7777").expect("bind echo");
+    std::thread::spawn(move || {
+        let mut b = [0u8; 2048];
+        while let Ok((n, peer)) = echo.recv_from(&mut b) {
+            let _ = echo.send_to(&b[..n], peer);
+        }
+    });
+    let mut child = spawn_sandbox_with_presto(
+        "pressure-sandbox",
+        "flow_pressure",
+        presto_pasta::Config::default(),
+    );
+    let status = child.wait().expect("wait sandbox");
+    exit(i32::from(!status.success()));
+}
+
+/// Sandbox namespace: exhaust the buffer pool with more UDP flows than
+/// it has buffers, then check that a fresh flow still gets through
+/// (idle flows must be evicted instead of blackholing new ones).
+fn pressure_sandbox() -> ! {
+    let _tap_fd = setup_and_pass_tap();
+
+    // Distinct source ports, so every socket is its own flow.
+    let flows: Vec<UdpSocket> = (0..2 * presto_pasta::Config::default().buffers)
+        .map(|_| {
+            let sock = UdpSocket::bind("0.0.0.0:0").expect("bind in sandbox");
+            sock.connect("10.0.0.1:7777").expect("connect");
+            let _ = sock.send(b"fill");
+            sock
+        })
+        .collect();
+    drop(flows);
+
+    let sock = UdpSocket::bind("0.0.0.0:0").expect("bind fresh socket");
+    sock.connect("10.0.0.1:7777").expect("connect");
+    sock.set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let mut reply = [0u8; 16];
+    let mut ok = false;
+    for _ in 0..20 {
+        sock.send(b"hello").expect("send");
+        if let Ok(n) = sock.recv(&mut reply) {
+            assert_eq!(&reply[..n], b"hello", "echo mismatch under flow pressure");
+            ok = true;
+            break;
+        }
+    }
+    assert!(ok, "new flow blackholed while the buffer pool is full");
+    exit(0);
+}
+
+/// New flows keep working once the buffer pool is exhausted by idle
+/// UDP flows; found by the differential fuzz test.
+#[test]
+fn flow_pressure() {
+    match std::env::var(ROLE).as_deref() {
+        Ok("pressure-host") => pressure_host(),
+        Ok("pressure-sandbox") => pressure_sandbox(),
+        _ => {}
+    }
+    run_in_userns("pressure-host", "flow_pressure", &[]);
+}
+
 /// UDP to a closed port is refused instead of timing out; found by the
 /// differential fuzz test.
 #[test]
