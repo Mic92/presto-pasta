@@ -472,7 +472,7 @@ impl EventLoop {
             flow::FlowKind::Tcp => unreachable!("TCP flows are created by new_tcp_flow"),
         };
         sock.set_nonblocking(true).ok()?;
-        let buf = self.pool.alloc()?;
+        let buf = self.alloc_flow_buf()?;
         let id = self.flows.insert(flow::Flow {
             key,
             kind,
@@ -484,6 +484,21 @@ impl EventLoop {
         });
         self.submit_flow_recv(id).ok()?;
         Some(id)
+    }
+
+    /// Buffer for a new flow. When the pool is dry, evict the
+    /// least-recently-used idle UDP/ping flow: its buffer is back once
+    /// the cancelled recv completes, so the guest's retry gets through
+    /// instead of new flows stalling until a flow expires.
+    fn alloc_flow_buf(&mut self) -> Option<buf::BufId> {
+        if let Some(buf) = self.pool.alloc() {
+            return Some(buf);
+        }
+        if let Some(id) = self.flows.lru_evictable() {
+            self.stats.flow_evicted();
+            self.remove_flow(id);
+        }
+        None
     }
 
     /// Apply the caller's flow policy (or the default: refuse loopback
@@ -803,7 +818,7 @@ impl EventLoop {
             .ok()
             .and_then(|v| u32::try_from(v).ok())
             .unwrap_or(u32::from(u16::MAX));
-        let buf = self.pool.alloc()?;
+        let buf = self.alloc_flow_buf()?;
         let id = self.flows.insert(flow::Flow {
             key,
             kind: flow::FlowKind::Tcp,

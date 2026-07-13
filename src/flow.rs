@@ -175,6 +175,21 @@ impl FlowTable {
             .collect()
     }
 
+    /// Least-recently-active UDP or ping flow that is not yet closing;
+    /// the eviction candidate when the buffer pool runs dry. TCP flows
+    /// are never evicted because they carry guest-visible connection
+    /// state.
+    #[must_use]
+    pub fn lru_evictable(&self) -> Option<usize> {
+        self.flows
+            .iter()
+            .enumerate()
+            .filter_map(|(id, slot)| slot.as_ref().map(|f| (id, f)))
+            .filter(|(_, f)| !f.closing && f.kind != FlowKind::Tcp)
+            .min_by_key(|(_, f)| f.last_active)
+            .map(|(id, _)| id)
+    }
+
     /// Ids of TCP flows with data in flight to the guest whose acks
     /// have not progressed since before `cutoff`.
     #[must_use]
@@ -226,6 +241,22 @@ mod tests {
         let c = t.insert(flow(1002));
         assert_eq!(c, a);
         assert!(t.get_by_id(b).is_some());
+    }
+
+    #[test]
+    fn lru_evictable_skips_tcp_and_closing() {
+        let mut t = FlowTable::default();
+        let oldest = t.insert(flow(1));
+        let newer = t.insert(flow(2));
+        t.get_mut(newer).unwrap().last_active = Instant::now() + std::time::Duration::from_secs(1);
+        let tcp = t.insert(flow(3));
+        t.get_mut(tcp).unwrap().kind = FlowKind::Tcp;
+        t.get_mut(tcp).unwrap().last_active = Instant::now()
+            .checked_sub(std::time::Duration::from_mins(1))
+            .unwrap();
+        assert_eq!(t.lru_evictable(), Some(oldest));
+        t.get_mut(oldest).unwrap().closing = true;
+        assert_eq!(t.lru_evictable(), Some(newer));
     }
 
     #[test]

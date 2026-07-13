@@ -25,6 +25,7 @@ mod imp {
         budget_short: u64,
         dup_ack_retransmits: u64,
         rto_retransmits: u64,
+        flows_evicted: u64,
     }
 
     impl Stats {
@@ -86,6 +87,10 @@ mod imp {
         pub fn rto_retransmit(&mut self) {
             self.rto_retransmits += 1;
         }
+
+        pub fn flow_evicted(&mut self) {
+            self.flows_evicted += 1;
+        }
     }
 
     impl Stats {
@@ -127,6 +132,7 @@ mod imp {
                 self.dup_ack_retransmits,
                 self.rto_retransmits
             );
+            eprintln!("presto-pasta stats: flows evicted {}", self.flows_evicted);
         }
     }
 }
@@ -169,6 +175,8 @@ mod imp {
         pub fn dup_ack_retransmit(&mut self) {}
         #[inline]
         pub fn rto_retransmit(&mut self) {}
+        #[inline]
+        pub fn flow_evicted(&mut self) {}
     }
 }
 
