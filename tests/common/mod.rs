@@ -32,16 +32,21 @@ nix::ioctl_write_ptr_bad!(
     libc::ifreq
 );
 
+/// Copy `name` into an ifreq name field. `c_char` signedness differs
+/// across targets, so convert per byte instead of casting.
+pub fn set_ifr_name(ifr: &mut libc::ifreq, name: &str) {
+    for (dst, src) in ifr.ifr_name.iter_mut().zip(name.bytes()) {
+        *dst = libc::c_char::from_ne_bytes([src]);
+    }
+}
+
 pub fn open_tap(name: &str) -> io::Result<OwnedFd> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open("/dev/net/tun")?;
     let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
-    #[expect(clippy::cast_possible_wrap, reason = "c_char is i8 on some targets")]
-    for (dst, src) in ifr.ifr_name.iter_mut().zip(name.bytes()) {
-        *dst = src as libc::c_char;
-    }
+    set_ifr_name(&mut ifr, name);
     ifr.ifr_ifru.ifru_flags = IFF_TAP | IFF_NO_PI | IFF_VNET_HDR;
     unsafe { tun_set_iff(file.as_raw_fd(), &raw const ifr) }.map_err(io::Error::from)?;
     Ok(OwnedFd::from(file))
