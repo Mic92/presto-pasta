@@ -158,9 +158,25 @@ impl FlowTable {
     /// Drop the flow, closing its socket, and hand back its buffer id.
     pub fn remove(&mut self, id: usize) -> Option<buf::BufId> {
         let flow = self.flows.get_mut(id)?.take()?;
-        self.by_key.remove(&flow.key);
+        // A newer flow may already own this key (see `mark_closing`),
+        // so only clear the entry when it still points at this flow.
+        if self.by_key.get(&flow.key) == Some(&id) {
+            self.by_key.remove(&flow.key);
+        }
         self.free.push(id);
         Some(flow.buf)
+    }
+
+    /// Mark a flow as closing and drop it from the by-key index so new
+    /// guest packets on the same 5-tuple create a fresh flow rather
+    /// than land in the dying one.
+    pub fn mark_closing(&mut self, id: usize) {
+        if let Some(f) = self.flows.get_mut(id).and_then(Option::as_mut) {
+            f.closing = true;
+            if self.by_key.get(&f.key) == Some(&id) {
+                self.by_key.remove(&f.key);
+            }
+        }
     }
 
     /// Ids of flows idle since before `cutoff` and not yet closing.
@@ -241,6 +257,19 @@ mod tests {
         let c = t.insert(flow(1002));
         assert_eq!(c, a);
         assert!(t.get_by_id(b).is_some());
+    }
+
+    #[test]
+    fn mark_closing_unindexes_flow() {
+        let mut t = FlowTable::default();
+        let a = t.insert(flow(1));
+        t.mark_closing(a);
+        assert!(t.get(&flow(1).key).is_none());
+        // A new flow on the same key must survive the deferred remove
+        // of the old one.
+        let b = t.insert(flow(1));
+        t.remove(a);
+        assert_eq!(t.get(&flow(1).key), Some(b));
     }
 
     #[test]
