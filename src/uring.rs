@@ -833,6 +833,10 @@ impl EventLoop {
             self.tcp_from_guest(id, &hdr, payload);
         } else if hdr.flags & (proto::TCP_SYN | proto::TCP_ACK | proto::TCP_RST) == proto::TCP_SYN {
             self.new_tcp_flow(key, &hdr);
+        } else if hdr.flags & proto::TCP_RST == 0 {
+            // Unknown (e.g. expired) connection: RST per RFC 9293
+            // CLOSED-state so the guest aborts rather than retransmit.
+            self.send_tcp_rst_no_flow(g.dst_ip, &hdr, payload.len());
         }
     }
 
@@ -1335,6 +1339,83 @@ impl EventLoop {
             gso_size: None,
         };
         self.send_tcp_segment(id, &seg);
+    }
+
+    /// Reset a segment that arrived for an unknown connection
+    /// (RFC 9293 CLOSED-state handling).
+    fn send_tcp_rst_no_flow(&mut self, remote: IpAddr, hdr: &proto::TcpHdr, payload_len: usize) {
+        // Per RFC 9293: with ACK, reflect SEG.ACK as our seq; without,
+        // ack everything the segment covered.
+        let (seq, ack, flags) = if hdr.flags & proto::TCP_ACK != 0 {
+            (hdr.ack, 0, proto::TCP_RST)
+        } else {
+            let seg_len = u32::try_from(payload_len).unwrap_or(0)
+                + u32::from(hdr.flags & proto::TCP_SYN != 0)
+                + u32::from(hdr.flags & proto::TCP_FIN != 0);
+            (
+                0,
+                hdr.seq.wrapping_add(seg_len),
+                proto::TCP_RST | proto::TCP_ACK,
+            )
+        };
+        let (guest4, guest6) = (self.cfg.guest4, self.cfg.guest6);
+        let eth_start = tap::VNET_HDR_LEN;
+        let ip_start = eth_start + proto::ETH_LEN;
+        let l4_len = u16::try_from(proto::TCP_HDR_LEN).expect("header length");
+        let (l4_start, ethertype, pseudo) = match remote {
+            IpAddr::V4(src) => (
+                ip_start + proto::IPV4_HDR_LEN,
+                proto::ETHERTYPE_IPV4,
+                proto::pseudo_v4(src, guest4, proto::IPPROTO_TCP, l4_len),
+            ),
+            IpAddr::V6(src) => (
+                ip_start + proto::IPV6_HDR_LEN,
+                proto::ETHERTYPE_IPV6,
+                proto::pseudo_v6(src, guest6, proto::IPPROTO_TCP, l4_len),
+            ),
+        };
+        let hdr_end = l4_start + proto::TCP_HDR_LEN;
+        let mut frame = [0u8; buf::HEADROOM];
+        proto::TcpHdr::write(
+            &mut frame[l4_start..hdr_end],
+            (hdr.dst_port, hdr.src_port),
+            seq,
+            ack,
+            flags,
+            0,
+            &[],
+            pseudo,
+            false,
+        );
+        match remote {
+            IpAddr::V4(src) => {
+                proto::Ipv4Hdr::write(
+                    &mut frame[ip_start..],
+                    src,
+                    guest4,
+                    proto::IPPROTO_TCP,
+                    l4_len,
+                );
+            }
+            IpAddr::V6(src) => {
+                proto::Ipv6Hdr::write(
+                    &mut frame[ip_start..],
+                    src,
+                    guest6,
+                    proto::IPPROTO_TCP,
+                    l4_len,
+                );
+            }
+        }
+        proto::EthHdr {
+            dst: self.guest_mac,
+            src: self.cfg.gateway_mac,
+            ethertype,
+        }
+        .write(&mut frame[eth_start..]);
+        frame[..eth_start].copy_from_slice(&tap::VnetHdr::default().to_bytes());
+        self.stats.tap_out(hdr_end);
+        let _ = nix::unistd::write(self.tap.fd(), &frame[..hdr_end]);
     }
 
     /// Abort the flow towards both sides.
