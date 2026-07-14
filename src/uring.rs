@@ -87,6 +87,9 @@ struct GuestFrame {
     proto: u8,
     /// Byte range of the L4 header + payload within the tap buffer.
     l4: std::ops::Range<usize>,
+    /// GSO segment size of a guest UDP super-frame, for splitting into
+    /// per-datagram sends.
+    udp_gso: Option<u16>,
 }
 
 pub struct EventLoop {
@@ -315,6 +318,7 @@ impl EventLoop {
     /// Parse the L2/L3 headers of a frame read from the tap.
     fn parse_frame(&self, len: usize) -> Option<GuestFrame> {
         let frame = &self.pool.get(self.tap_buf)[..len];
+        let vnet = tap::VnetHdr::parse(frame.get(..tap::VNET_HDR_LEN)?.try_into().ok()?);
         let l3_off = tap::VNET_HDR_LEN + proto::ETH_LEN;
         let l3 = frame.get(l3_off..)?;
         let eth = proto::EthHdr::parse(frame.get(tap::VNET_HDR_LEN..)?)?;
@@ -344,12 +348,17 @@ impl EventLoop {
         };
         let l4_start = l3_off + l4_off;
         let l4_end = (l4_start + payload_len).min(len);
+        // TCP TSO needs no splitting (stream socket); UDP GSO carries
+        // several datagrams behind one header.
+        let udp_gso = (vnet.gso_type == tap::VIRTIO_NET_HDR_GSO_UDP_L4 && vnet.gso_size > 0)
+            .then_some(vnet.gso_size);
         Some(GuestFrame {
             src_mac: eth.src,
             src_ip,
             dst_ip,
             proto: ip_proto,
             l4: l4_start..l4_end,
+            udp_gso,
         })
     }
 
@@ -383,7 +392,16 @@ impl EventLoop {
         };
         let payload =
             g.l4.start + proto::UDP_HDR_LEN..(g.l4.start + usize::from(udp.len)).min(g.l4.end);
-        self.forward(key, flow::FlowKind::Udp, payload);
+        if let Some(seg) = g.udp_gso.map(usize::from) {
+            let mut off = payload.start;
+            while off < payload.end {
+                let end = (off + seg).min(payload.end);
+                self.forward(key, flow::FlowKind::Udp, off..end);
+                off = end;
+            }
+        } else {
+            self.forward(key, flow::FlowKind::Udp, payload);
+        }
     }
 
     /// Forward an ICMP/ICMPv6 echo request over a ping socket. The
