@@ -984,10 +984,12 @@ impl EventLoop {
             return;
         }
         if hdr.flags & proto::TCP_SYN != 0 {
-            // Our SYN-ACK was lost.
-            if t.sent_unacked == 0 {
-                self.send_syn_ack(id);
-            }
+            // Our SYN-ACK was lost. Any data we already sent was dropped
+            // by the guest (still in SYN-SENT), so rewind and resend it
+            // once the handshake completes.
+            t.sent_unacked = 0;
+            t.dup_acks = 0;
+            self.send_syn_ack(id);
             return;
         }
         let mut ack_guest = false;
