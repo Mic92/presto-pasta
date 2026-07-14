@@ -133,7 +133,9 @@ impl Config {
     #[must_use]
     pub fn nat64_target(&self, dst: SocketAddr) -> SocketAddr {
         match (self.nat64_prefix, dst.ip()) {
-            (Some(prefix), IpAddr::V4(v4)) => {
+            // Loopback is always reachable over native IPv4 (and
+            // RFC 6052 forbids embedding non-global addresses).
+            (Some(prefix), IpAddr::V4(v4)) if !v4.is_loopback() => {
                 let mut octets = prefix.octets();
                 octets[12..16].copy_from_slice(&v4.octets());
                 SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), dst.port())
@@ -232,6 +234,9 @@ mod tests {
             cfg.nat64_target("10.0.0.1:7878".parse().unwrap()),
             "[64:ff9b::a00:1]:7878".parse().unwrap()
         );
+        // Loopback stays on native IPv4 even with a NAT64 prefix set.
+        let lo: std::net::SocketAddr = "127.0.0.53:53".parse().unwrap();
+        assert_eq!(cfg.nat64_target(lo), lo);
         // IPv6 destinations and unconfigured prefixes pass through.
         let v6: std::net::SocketAddr = "[fd00::1]:53".parse().unwrap();
         assert_eq!(cfg.nat64_target(v6), v6);
