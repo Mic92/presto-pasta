@@ -1030,15 +1030,17 @@ impl EventLoop {
         if hdr.flags & proto::TCP_FIN != 0
             && accepted == payload.len()
             && let Some(t) = self.flows.get_mut(id).and_then(|f| f.tcp.as_mut())
-            && !t.guest_fin_received
-            && hdr
-                .seq
-                .wrapping_add(u32::try_from(payload.len()).unwrap_or(0))
-                == t.seq_from_guest
         {
-            t.guest_fin_received = true;
-            t.seq_from_guest = t.seq_from_guest.wrapping_add(1);
-            let _ = shutdown(raw, Shutdown::Write);
+            let fin_seq = hdr
+                .seq
+                .wrapping_add(u32::try_from(payload.len()).unwrap_or(0));
+            if !t.guest_fin_received && fin_seq == t.seq_from_guest {
+                t.guest_fin_received = true;
+                t.seq_from_guest = t.seq_from_guest.wrapping_add(1);
+                let _ = shutdown(raw, Shutdown::Write);
+            }
+            // Ack the FIN, and re-ack a retransmitted one so the guest
+            // is not stuck retrying when our first ack was lost.
             ack_guest = true;
         }
         if ack_guest {
