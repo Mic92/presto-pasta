@@ -113,7 +113,13 @@ impl EventLoop {
     /// Fails when the ring cannot be created or registration fails
     /// (needs kernel >= 5.10 for ring restrictions).
     pub fn new(cfg: &Config, tap: tap::Tap) -> io::Result<Self> {
-        let ring = IoUring::builder().setup_r_disabled().build(256)?;
+        // Each flow keeps at most one recv/poll armed, plus the tap
+        // read, timer and per-flow cancels; size the ring so a full
+        // burst of completions can re-arm without overflowing the SQ.
+        let ring_entries = u32::try_from(cfg.buffers.saturating_mul(2))
+            .unwrap_or(u32::MAX)
+            .clamp(256, 32_768);
+        let ring = IoUring::builder().setup_r_disabled().build(ring_entries)?;
         let mut pool = buf::Pool::new(cfg.buffers);
 
         let ctx = |what: &'static str| {
