@@ -516,7 +516,14 @@ impl EventLoop {
             tcp: None,
             closing: false,
         });
-        self.submit_flow_recv(id).ok()?;
+        if self.submit_flow_recv(id).is_err() {
+            // No recv is armed, so nothing would reap the slot; undo
+            // the insert to give the buffer back.
+            if let Some(buf) = self.flows.remove(id) {
+                self.pool.free(buf);
+            }
+            return None;
+        }
         Some(id)
     }
 
@@ -895,7 +902,12 @@ impl EventLoop {
             }),
             closing: false,
         });
-        self.arm_poll(id, POLL_OUT).ok()?;
+        if self.arm_poll(id, POLL_OUT).is_err() {
+            if let Some(buf) = self.flows.remove(id) {
+                self.pool.free(buf);
+            }
+            return None;
+        }
         Some(id)
     }
 
