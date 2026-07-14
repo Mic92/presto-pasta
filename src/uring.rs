@@ -577,9 +577,15 @@ impl EventLoop {
             let Ok(n) = recv(raw, room, MsgFlags::MSG_DONTWAIT) else {
                 break;
             };
-            self.stats.sock_recv(n == 0);
+            self.stats.sock_recv(false);
             if n == 0 {
-                break;
+                // Zero-length is a real datagram (UDP has no EOF) and
+                // cannot ride in a GSO super-frame; deliver it on its
+                // own. Remaining queued datagrams arrive via the
+                // re-armed recv.
+                self.reply_to_guest(id, total, gso_of(total, seg));
+                self.reply_to_guest(id, 0, None);
+                return;
             }
             if n <= seg && total + n <= max {
                 total += n;
