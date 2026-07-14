@@ -301,10 +301,16 @@ impl UdpHdr {
         if b.len() < UDP_HDR_LEN {
             return None;
         }
+        let len = u16::from_be_bytes([b[4], b[5]]);
+        // A length below the header size is malformed and would yield
+        // an inverted payload slice in the caller.
+        if usize::from(len) < UDP_HDR_LEN {
+            return None;
+        }
         Some(Self {
             src_port: u16::from_be_bytes([b[0], b[1]]),
             dst_port: u16::from_be_bytes([b[2], b[3]]),
-            len: u16::from_be_bytes([b[4], b[5]]),
+            len,
         })
     }
 
@@ -477,6 +483,17 @@ mod tests {
         off[6] = 0x00;
         off[7] = 0x01; // fragment offset 1
         assert!(Ipv4Hdr::parse(&off).is_none());
+    }
+
+    #[test]
+    fn udp_short_length_rejected() {
+        let mut b = [0u8; UDP_HDR_LEN];
+        b[4..6].copy_from_slice(&8u16.to_be_bytes());
+        assert!(UdpHdr::parse(&b).is_some());
+        b[4..6].copy_from_slice(&7u16.to_be_bytes());
+        assert!(UdpHdr::parse(&b).is_none());
+        b[4..6].copy_from_slice(&0u16.to_be_bytes());
+        assert!(UdpHdr::parse(&b).is_none());
     }
 
     #[test]
