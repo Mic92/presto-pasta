@@ -440,15 +440,20 @@ impl EventLoop {
     /// resolver, re-read from resolv.conf per flow so changes (e.g. by
     /// a DHCP client on the host) are picked up without a reload.
     fn new_flow(&mut self, key: flow::FlowKey, kind: flow::FlowKind) -> Option<usize> {
-        if !self.flow_allowed(&key) {
+        // DNS to the gateway is presto-pasta's own service; exempt it
+        // from the caller's policy, which typically rejects the
+        // link-local gateway address.
+        let dns_redirect = kind == flow::FlowKind::Udp
+            && self.cfg.dns_forward
+            && key.dst.port() == 53
+            && (key.dst.ip() == IpAddr::V4(self.cfg.gateway4)
+                || key.dst.ip() == IpAddr::V6(self.cfg.gateway6));
+        if !dns_redirect && !self.flow_allowed(&key) {
             return None;
         }
         let sock = match kind {
             flow::FlowKind::Udp => {
-                let gateway_dns = key.dst.port() == 53
-                    && (key.dst.ip() == IpAddr::V4(self.cfg.gateway4)
-                        || key.dst.ip() == IpAddr::V6(self.cfg.gateway6));
-                let target = if gateway_dns && self.cfg.dns_forward {
+                let target = if dns_redirect {
                     dns::host_resolver()?
                 } else {
                     key.dst
