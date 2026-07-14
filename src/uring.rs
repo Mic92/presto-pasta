@@ -195,7 +195,7 @@ impl EventLoop {
                     }
                     self.submit_tap_read()?;
                 } else if ud == TIMER_UD {
-                    self.retransmit_stalled_flows();
+                    self.tcp_periodic();
                     self.expire_flows();
                     self.submit_timer()?;
                 } else if ud == CANCEL_UD {
@@ -261,19 +261,41 @@ impl EventLoop {
         self.push(&timeout)
     }
 
-    /// Resend in-flight data of flows whose acks stalled for `RTO`.
-    fn retransmit_stalled_flows(&mut self) {
+    /// Timer-driven TCP maintenance: flush deferred acks (RFC 1122
+    /// bounds a delayed ack to 500 ms), RTO-retransmit stalled data or
+    /// an unacked FIN, and probe a closed guest window so a lost
+    /// window-update ack cannot deadlock the flow.
+    fn tcp_periodic(&mut self) {
         let Some(cutoff) = Instant::now().checked_sub(RTO) else {
             return;
         };
-        for id in self.flows.retransmit_due(cutoff) {
-            if let Some(t) = self.flows.get_mut(id).and_then(|f| f.tcp.as_mut()) {
+        for id in self.flows.tcp_timer_due(cutoff) {
+            let Some(t) = self.flows.get_mut(id).and_then(|f| f.tcp.as_mut()) else {
+                continue;
+            };
+            if t.ack_deferred {
+                t.ack_deferred = false;
+                self.send_tcp_control(id, proto::TCP_ACK);
+            }
+            let Some(t) = self.flows.get_mut(id).and_then(|f| f.tcp.as_mut()) else {
+                continue;
+            };
+            if t.last_progress >= cutoff {
+                continue;
+            }
+            if t.sent_unacked > 0 {
                 t.sent_unacked = 0;
                 t.dup_acks = 0;
                 t.last_progress = Instant::now();
                 self.stats.rto_retransmit();
+                self.tcp_data_to_guest(id);
+            } else if t.host_fin == flow::FinState::Sent {
+                t.last_progress = Instant::now();
+                self.send_tcp_control(id, proto::TCP_FIN | proto::TCP_ACK);
+            } else if t.guest_window == 0 && t.state == flow::TcpState::Established {
+                t.last_progress = Instant::now();
+                self.send_tcp_probe(id);
             }
-            self.tcp_data_to_guest(id);
         }
     }
 
@@ -1161,6 +1183,7 @@ impl EventLoop {
                 self.send_tcp_control(id, proto::TCP_FIN | proto::TCP_ACK);
                 if let Some(t) = self.flows.get_mut(id).and_then(|f| f.tcp.as_mut()) {
                     t.host_fin = flow::FinState::Sent;
+                    t.last_progress = Instant::now();
                 }
             } else if drained && !poll_armed {
                 let _ = self.arm_poll(id, POLL_RECV);
@@ -1339,6 +1362,28 @@ impl EventLoop {
             seq: t.seq_una.wrapping_add(t.sent_unacked),
             ack: t.seq_from_guest,
             flags,
+            window,
+            options: &[],
+            payload: buf::HEADROOM..buf::HEADROOM,
+            payload2: buf::HEADROOM..buf::HEADROOM,
+            gso_size: None,
+        };
+        self.send_tcp_segment(id, &seg);
+    }
+
+    /// Zero-window probe: a byte just left of the window edge makes
+    /// the guest reply with an ack carrying its current window,
+    /// recovering from a lost window-reopen ack.
+    fn send_tcp_probe(&mut self, id: usize) {
+        self.stats.tcp_ctrl();
+        let window = self.tcp_window_to_guest(id);
+        let Some(t) = self.tcp_state(id) else {
+            return;
+        };
+        let seg = TcpSegment {
+            seq: t.seq_una.wrapping_sub(1),
+            ack: t.seq_from_guest,
+            flags: proto::TCP_ACK,
             window,
             options: &[],
             payload: buf::HEADROOM..buf::HEADROOM,

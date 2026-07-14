@@ -206,19 +206,26 @@ impl FlowTable {
             .map(|(id, _)| id)
     }
 
-    /// Ids of TCP flows with data in flight to the guest whose acks
-    /// have not progressed since before `cutoff`.
+    /// Ids of TCP flows that need timer-driven action: RTO retransmit
+    /// (data or FIN in flight and unacked past `cutoff`), zero-window
+    /// probe (guest window closed past `cutoff`), or a delayed-ack
+    /// flush (owed ack must go out within one timer period per
+    /// RFC 1122).
     #[must_use]
-    pub fn retransmit_due(&self, cutoff: Instant) -> Vec<usize> {
+    pub fn tcp_timer_due(&self, cutoff: Instant) -> Vec<usize> {
         self.flows
             .iter()
             .enumerate()
             .filter_map(|(id, slot)| slot.as_ref().map(|f| (id, f)))
             .filter(|(_, f)| {
                 !f.closing
-                    && f.tcp
-                        .as_ref()
-                        .is_some_and(|t| t.sent_unacked > 0 && t.last_progress < cutoff)
+                    && f.tcp.as_ref().is_some_and(|t| {
+                        t.ack_deferred
+                            || (t.last_progress < cutoff
+                                && (t.sent_unacked > 0
+                                    || t.host_fin == FinState::Sent
+                                    || (t.guest_window == 0 && t.state == TcpState::Established)))
+                    })
             })
             .map(|(id, _)| id)
             .collect()
