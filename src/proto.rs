@@ -78,6 +78,11 @@ impl Ipv4Hdr {
         if header_len < IPV4_HDR_LEN || b.len() < header_len {
             return None;
         }
+        // Fragments (MF set or non-zero offset) are not reassembled;
+        // drop them so payload bytes are never parsed as an L4 header.
+        if b[6] & 0x3f != 0 || b[7] != 0 {
+            return None;
+        }
         Some(Self {
             src: Ipv4Addr::new(b[12], b[13], b[14], b[15]),
             dst: Ipv4Addr::new(b[16], b[17], b[18], b[19]),
@@ -452,6 +457,26 @@ mod tests {
         assert_eq!(h.proto, IPPROTO_UDP);
         assert_eq!(h.total_len, 120);
         assert_eq!(checksum(&b, 0), 0);
+    }
+
+    #[test]
+    fn ipv4_fragment_rejected() {
+        let mut b = [0u8; IPV4_HDR_LEN];
+        Ipv4Hdr::write(
+            &mut b,
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 2),
+            IPPROTO_UDP,
+            100,
+        );
+        assert!(Ipv4Hdr::parse(&b).is_some());
+        let mut mf = b;
+        mf[6] = 0x20; // MF flag
+        assert!(Ipv4Hdr::parse(&mf).is_none());
+        let mut off = b;
+        off[6] = 0x00;
+        off[7] = 0x01; // fragment offset 1
+        assert!(Ipv4Hdr::parse(&off).is_none());
     }
 
     #[test]
