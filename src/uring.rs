@@ -143,7 +143,9 @@ impl EventLoop {
             guest_mac: [0; 6],
             tap_buf,
             stats: crate::stats::Stats::new(),
-            timer_ts: types::Timespec::new().sec(TIMER_INTERVAL.as_secs()),
+            timer_ts: types::Timespec::new()
+                .sec(TIMER_INTERVAL.as_secs())
+                .nsec(TIMER_INTERVAL.subsec_nanos()),
         })
     }
 
