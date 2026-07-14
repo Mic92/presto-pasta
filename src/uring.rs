@@ -1077,6 +1077,9 @@ impl EventLoop {
             t.sent_unacked -= data_acked;
             t.seq_una = t.seq_una.wrapping_add(data_acked);
             if advance > data_acked {
+                // The FIN's phantom byte was acked; advance past it so
+                // subsequent control segments carry an acceptable seq.
+                t.seq_una = t.seq_una.wrapping_add(1);
                 t.host_fin = flow::FinState::Acked;
             }
             if data_acked > 0 {
