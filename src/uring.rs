@@ -513,7 +513,15 @@ impl EventLoop {
         };
         match &self.cfg.allow_flow {
             Some(filter) => filter(&dst),
-            None => !dst.ip.is_loopback(),
+            // Default policy: refuse loopback, including IPv4-mapped
+            // (::ffff:127.0.0.0/8) which a dual-stack socket delivers
+            // to host loopback.
+            None => match dst.ip {
+                IpAddr::V6(v6) => !v6
+                    .to_ipv4_mapped()
+                    .map_or_else(|| v6.is_loopback(), |v4| v4.is_loopback()),
+                IpAddr::V4(v4) => !v4.is_loopback(),
+            },
         }
     }
 
