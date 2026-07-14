@@ -46,6 +46,9 @@ const WINDOW_SHIFT: u8 = 7;
 const TCP_MSS: u16 = 65_495;
 /// Fallback MSS when the guest's SYN carries no MSS option (RFC 9293).
 const TCP_DEFAULT_MSS: u16 = 536;
+/// Floor for the guest-announced MSS; a tiny or zero value would spin
+/// the per-segment send loop.
+const TCP_MIN_MSS: u16 = 536;
 /// Largest TCP payload per super-frame: the IP total length field is
 /// 16 bits and must also cover IP and TCP headers.
 const TCP_MAX_PAYLOAD: usize = 65_535 - 60;
@@ -872,7 +875,7 @@ impl EventLoop {
                 guest_window: u32::from(syn.window),
                 // Clamp to the RFC 7323 maximum so shifting stays sound.
                 guest_wscale: syn.wscale.map(|s| s.min(14)),
-                guest_mss: syn.mss.unwrap_or(TCP_DEFAULT_MSS),
+                guest_mss: syn.mss.unwrap_or(TCP_DEFAULT_MSS).max(TCP_MIN_MSS),
                 sndbuf,
                 dup_acks: 0,
                 buffered: 0,
