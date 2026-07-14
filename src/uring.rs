@@ -298,9 +298,7 @@ impl EventLoop {
             .get_by_id(id)
             .is_some_and(|f| f.tcp.as_ref().is_none_or(|t| t.poll_armed));
         if pending {
-            if let Some(f) = self.flows.get_mut(id) {
-                f.closing = true;
-            }
+            self.flows.mark_closing(id);
             let cancel = opcode::AsyncCancel::new(id as u64)
                 .build()
                 .user_data(CANCEL_UD);
