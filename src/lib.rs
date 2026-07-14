@@ -69,6 +69,15 @@ impl FlowDst {
                     || (ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 64))
             }
             IpAddr::V6(ip) => {
+                // ::ffff:0:0/96 reaches the host's IPv4 stack on a
+                // dual-stack socket; classify by the embedded address.
+                if let Some(v4) = ip.to_ipv4_mapped() {
+                    return (FlowDst {
+                        ip: IpAddr::V4(v4),
+                        ..*self
+                    })
+                    .is_public();
+                }
                 let seg0 = ip.segments()[0];
                 !(ip.is_loopback()
                     || ip.is_multicast()
@@ -255,6 +264,10 @@ mod tests {
             "fe80::1",
             "ff02::1",
             "::",
+            // IPv4-mapped: classified by the embedded v4 address.
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::ffff:169.254.169.254",
         ] {
             assert!(!dst(ip).is_public(), "{ip} should not be public");
         }
