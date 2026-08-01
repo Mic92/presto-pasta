@@ -167,6 +167,20 @@ pub struct Presto {
     /// Write ends of liveness pipes; dropped (closing the read ends'
     /// peers) when the event loop exits.
     liveness: Vec<OwnedFd>,
+    /// Read ends of shutdown pipes. The event loop exits when any of
+    /// them hangs up.
+    shutdown: Vec<OwnedFd>,
+}
+
+/// Stops the datapath. [`Presto::run`] returns `Ok(())` when this is
+/// dropped or [`shutdown`](Self::shutdown) is called.
+pub struct ShutdownHandle {
+    _write: OwnedFd,
+}
+
+impl ShutdownHandle {
+    /// Stop the event loop. This is equivalent to dropping the handle.
+    pub fn shutdown(self) {}
 }
 
 impl Presto {
@@ -179,7 +193,21 @@ impl Presto {
             cfg,
             tap: tap::Tap::new(tap_fd),
             liveness: Vec::new(),
+            shutdown: Vec::new(),
         }
+    }
+
+    /// A handle whose drop (or [`ShutdownHandle::shutdown`]) makes
+    /// [`run`](Self::run) return `Ok(())`, so a supervisor can stop the
+    /// datapath once the sandboxed job is gone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pipe cannot be created.
+    pub fn shutdown_handle(&mut self) -> io::Result<ShutdownHandle> {
+        let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
+        self.shutdown.push(read);
+        Ok(ShutdownHandle { _write: write })
     }
 
     /// A liveness fd for a supervisor: it signals `POLLHUP`/EOF when
@@ -196,14 +224,14 @@ impl Presto {
         Ok(read)
     }
 
-    /// Run the event loop until the tap fd is torn down or an
-    /// unrecoverable error occurs.
+    /// Run the event loop until the tap fd is torn down, a shutdown
+    /// handle is dropped or an unrecoverable error occurs.
     ///
     /// # Errors
     ///
     /// Returns I/O errors from the ring or the tap fd.
     pub fn run(self) -> io::Result<()> {
-        let event_loop = uring::EventLoop::new(&self.cfg, self.tap)?;
+        let event_loop = uring::EventLoop::new(&self.cfg, self.tap, self.shutdown)?;
         // After setup so ring and tap initialization stay unrestricted.
         #[cfg(feature = "seccomp")]
         seccomp::apply()?;
