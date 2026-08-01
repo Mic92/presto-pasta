@@ -26,8 +26,8 @@ const TAP_UD: u64 = u64::MAX;
 const TIMER_UD: u64 = u64::MAX - 1;
 /// `user_data` of cancel requests issued by flow expiry.
 const CANCEL_UD: u64 = u64::MAX - 2;
-/// `user_data` of the shutdown pipe polls.
-const SHUTDOWN_UD: u64 = u64::MAX - 3;
+/// `user_data` of the stop-fd polls.
+const STOP_UD: u64 = u64::MAX - 3;
 
 /// Idle time after which a flow's socket and buffer are reclaimed.
 const FLOW_EXPIRY: Duration = Duration::from_mins(3);
@@ -107,9 +107,8 @@ pub struct EventLoop {
     tap_buf: buf::BufId,
     stats: crate::stats::Stats,
     timer_ts: types::Timespec,
-    /// Read ends of shutdown pipes. A hangup on any of them stops the
-    /// event loop.
-    shutdown: Vec<OwnedFd>,
+    /// Stop fds: the event loop exits when one becomes readable or hangs up.
+    stop: Vec<OwnedFd>,
 }
 
 impl EventLoop {
@@ -117,7 +116,7 @@ impl EventLoop {
     ///
     /// Fails when the ring cannot be created or registration fails
     /// (needs kernel >= 5.10 for ring restrictions).
-    pub fn new(cfg: &Config, tap: tap::Tap, shutdown: Vec<OwnedFd>) -> io::Result<Self> {
+    pub fn new(cfg: &Config, tap: tap::Tap, stop: Vec<OwnedFd>) -> io::Result<Self> {
         // Each flow keeps at most one recv/poll armed, plus the tap
         // read, timer and per-flow cancels; size the ring so a full
         // burst of completions can re-arm without overflowing the SQ.
@@ -163,7 +162,7 @@ impl EventLoop {
             timer_ts: types::Timespec::new()
                 .sec(TIMER_INTERVAL.as_secs())
                 .nsec(TIMER_INTERVAL.subsec_nanos()),
-            shutdown,
+            stop,
         })
     }
 
@@ -175,7 +174,7 @@ impl EventLoop {
     pub fn run(mut self) -> io::Result<()> {
         self.submit_tap_read()?;
         self.submit_timer()?;
-        self.submit_shutdown_polls()?;
+        self.submit_stop_polls()?;
         // Drained CQEs are copied into a scratch vector (reused across
         // iterations) so the borrow on the ring ends before handling.
         let mut completions: Vec<(u64, i32)> = Vec::new();
@@ -189,7 +188,7 @@ impl EventLoop {
             );
             self.stats.wakeup(completions.len());
             for &(ud, res) in &completions {
-                if ud == SHUTDOWN_UD {
+                if ud == STOP_UD {
                     return Ok(());
                 }
                 if ud == TAP_UD {
@@ -271,13 +270,12 @@ impl EventLoop {
         self.push(&timeout)
     }
 
-    /// Arm a poll on every shutdown pipe so a hangup stops the loop.
-    fn submit_shutdown_polls(&mut self) -> io::Result<()> {
-        for i in 0..self.shutdown.len() {
-            let fd = types::Fd(self.shutdown[i].as_raw_fd());
+    fn submit_stop_polls(&mut self) -> io::Result<()> {
+        for i in 0..self.stop.len() {
+            let fd = types::Fd(self.stop[i].as_raw_fd());
             let poll = opcode::PollAdd::new(fd, POLL_RECV | POLL_HUP)
                 .build()
-                .user_data(SHUTDOWN_UD);
+                .user_data(STOP_UD);
             self.push(&poll)?;
         }
         Ok(())

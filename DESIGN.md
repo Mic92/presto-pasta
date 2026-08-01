@@ -53,8 +53,9 @@ a built-in seccomp filter is an optional feature.
   the configured /96 prefix (RFC 6052) and the host sockets use IPv6;
   the guest keeps speaking IPv4. The prefix can be discovered via DNS64
   (RFC 7050)
-- liveness event fd on the handle so a supervisor can fail the job when
-  the event loop exits
+- caller-supplied stop fds (pidfd, pipe or socketpair end): the event
+  loop exits when one fires and drops them on exit, so a kept peer end
+  tells a supervisor the datapath died
 
 Out of scope: inbound port forwarding, ARP/NDP, DHCP/RA, namespace
 setup, privilege management, passt socket mode, vhost-user, migration,

@@ -193,7 +193,10 @@ fn fuzz_host(sandbox_role: &str, test: &str) -> ! {
 
     let (mut child, tap_fd) = spawn_sandbox_and_recv_tap(sandbox_role, test, &fuzz_env());
     let mut presto = presto_pasta::Presto::new(presto_pasta::Config::default(), tap_fd);
-    let liveness = presto.liveness_fd().expect("liveness fd");
+    // The read end hangs up when the loop exits and drops stop_w.
+    let (liveness, stop_w) = std::io::pipe().expect("pipe");
+    let liveness = OwnedFd::from(liveness);
+    presto.stop_on(OwnedFd::from(stop_w));
     std::thread::spawn(move || presto.run().expect("presto-pasta run"));
     // Hand the sandbox its end of the veth pair.
     ip(&format!("link set veth0 netns {}", child.id()));

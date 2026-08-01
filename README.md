@@ -63,7 +63,7 @@ let cfg = presto_pasta::Config {
     ..presto_pasta::Config::default()
 };
 let mut presto = presto_pasta::Presto::new(cfg, tap_fd);
-let liveness = presto.liveness_fd()?;   // POLLHUP when the datapath dies
+presto.stop_on(pidfd); // stop the datapath when the sandboxed process dies
 std::thread::spawn(move || presto.run());
 ```
 

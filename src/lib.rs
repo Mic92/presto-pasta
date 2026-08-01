@@ -19,7 +19,8 @@
 //!     ..presto_pasta::Config::default()
 //! };
 //! let mut presto = presto_pasta::Presto::new(cfg, tap_fd);
-//! let liveness = presto.liveness_fd().unwrap(); // POLLHUP when the datapath dies
+//! let (supervisor, stop) = std::io::pipe().unwrap();
+//! presto.stop_on(stop.into()); // close `supervisor` to stop the datapath
 //! std::thread::spawn(move || presto.run());
 //! ```
 
@@ -164,23 +165,8 @@ impl Default for Config {
 pub struct Presto {
     cfg: Config,
     tap: tap::Tap,
-    /// Write ends of liveness pipes; dropped (closing the read ends'
-    /// peers) when the event loop exits.
-    liveness: Vec<OwnedFd>,
-    /// Read ends of shutdown pipes. The event loop exits when any of
-    /// them hangs up.
-    shutdown: Vec<OwnedFd>,
-}
-
-/// Stops the datapath. [`Presto::run`] returns `Ok(())` when this is
-/// dropped or [`shutdown`](Self::shutdown) is called.
-pub struct ShutdownHandle {
-    _write: OwnedFd,
-}
-
-impl ShutdownHandle {
-    /// Stop the event loop. This is equivalent to dropping the handle.
-    pub fn shutdown(self) {}
+    /// Supervision fds registered via [`stop_on`](Self::stop_on).
+    stop: Vec<OwnedFd>,
 }
 
 impl Presto {
@@ -192,46 +178,27 @@ impl Presto {
         Self {
             cfg,
             tap: tap::Tap::new(tap_fd),
-            liveness: Vec::new(),
-            shutdown: Vec::new(),
+            stop: Vec::new(),
         }
     }
 
-    /// A handle whose drop (or [`ShutdownHandle::shutdown`]) makes
-    /// [`run`](Self::run) return `Ok(())`, so a supervisor can stop the
-    /// datapath once the sandboxed job is gone.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the pipe cannot be created.
-    pub fn shutdown_handle(&mut self) -> io::Result<ShutdownHandle> {
-        let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
-        self.shutdown.push(read);
-        Ok(ShutdownHandle { _write: write })
+    /// Register a stop fd: [`run`](Self::run) returns `Ok(())` once
+    /// `fd` becomes readable or hangs up (a pidfd stops the datapath
+    /// when that process dies). The event loop drops the fd when it
+    /// exits, so a kept pipe/socketpair peer doubles as a liveness
+    /// signal.
+    pub fn stop_on(&mut self, fd: OwnedFd) {
+        self.stop.push(fd);
     }
 
-    /// A liveness fd for a supervisor: it signals `POLLHUP`/EOF when
-    /// the event loop exits (or the datapath process dies), so the
-    /// supervisor can fail the sandboxed job instead of letting it
-    /// hang without network.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the pipe cannot be created.
-    pub fn liveness_fd(&mut self) -> io::Result<OwnedFd> {
-        let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
-        self.liveness.push(write);
-        Ok(read)
-    }
-
-    /// Run the event loop until the tap fd is torn down, a shutdown
-    /// handle is dropped or an unrecoverable error occurs.
+    /// Run the event loop until the tap fd is torn down, a stop fd
+    /// fires or an unrecoverable error occurs.
     ///
     /// # Errors
     ///
     /// Returns I/O errors from the ring or the tap fd.
     pub fn run(self) -> io::Result<()> {
-        let event_loop = uring::EventLoop::new(&self.cfg, self.tap, self.shutdown)?;
+        let event_loop = uring::EventLoop::new(&self.cfg, self.tap, self.stop)?;
         // After setup so ring and tap initialization stay unrestricted.
         #[cfg(feature = "seccomp")]
         seccomp::apply()?;
