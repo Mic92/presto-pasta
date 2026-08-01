@@ -79,10 +79,9 @@ fn spawn_sandbox_with_presto(
         if let Some(cpu) = datapath_cpu
             && let Ok(cpu) = cpu.parse()
         {
-            let mut set = nix::sched::CpuSet::new();
-            set.set(cpu).expect("cpu id in range");
-            nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &set)
-                .expect("pin datapath thread");
+            let mut set = rustix::thread::CpuSet::new();
+            set.set(cpu);
+            rustix::thread::sched_setaffinity(None, &set).expect("pin datapath thread");
         }
         presto.run().expect("presto-pasta run");
     });

@@ -4,14 +4,18 @@
 //! helpers.
 
 use std::io;
+use std::mem::MaybeUninit;
 use std::net::{TcpStream, UdpSocket};
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::process::Command;
 use std::time::Duration;
 
-use nix::sys::socket::{
-    AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag, SockProtocol, SockType,
-    recvmsg, sendmsg, socket, socketpair,
+use rustix::cmsg_space;
+use rustix::ioctl::{Opcode, Setter, ioctl, opcode};
+use rustix::net::{
+    AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
+    SendAncillaryMessage, SendFlags, SocketFlags, SocketType, ipproto, recvmsg, sendmsg,
+    socket_with, socketpair,
 };
 
 /// Environment variable selecting which namespace role a re-executed
@@ -26,11 +30,7 @@ const IFF_TAP: i16 = 0x0002;
 const IFF_NO_PI: i16 = 0x1000;
 const IFF_VNET_HDR: i16 = 0x4000;
 
-nix::ioctl_write_ptr_bad!(
-    tun_set_iff,
-    nix::request_code_write!(b'T', 202, std::mem::size_of::<libc::c_int>()),
-    libc::ifreq
-);
+const TUNSETIFF: Opcode = opcode::write::<libc::c_int>(b'T', 202);
 
 /// Copy `name` into an ifreq name field. `c_char` signedness differs
 /// across targets, so convert per byte instead of casting.
@@ -48,7 +48,7 @@ pub fn open_tap(name: &str) -> io::Result<OwnedFd> {
     let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
     set_ifr_name(&mut ifr, name);
     ifr.ifr_ifru.ifru_flags = IFF_TAP | IFF_NO_PI | IFF_VNET_HDR;
-    unsafe { tun_set_iff(file.as_raw_fd(), &raw const ifr) }.map_err(io::Error::from)?;
+    unsafe { ioctl(&file, Setter::<TUNSETIFF, libc::ifreq>::new(ifr)) }?;
     Ok(OwnedFd::from(file))
 }
 
@@ -117,13 +117,15 @@ pub fn setup_and_pass_tap() -> OwnedFd {
 
     let pass_fd: RawFd = std::env::var(PASS_FD).unwrap().parse().unwrap();
     let pass = unsafe { BorrowedFd::borrow_raw(pass_fd) };
-    let fds = [tap_fd.as_raw_fd()];
-    sendmsg::<()>(
-        pass.as_raw_fd(),
+    let mut space = vec![MaybeUninit::uninit(); cmsg_space!(ScmRights(1))];
+    let mut cmsg = SendAncillaryBuffer::new(&mut space);
+    let fds = [tap_fd.as_fd()];
+    cmsg.push(SendAncillaryMessage::ScmRights(&fds));
+    sendmsg(
+        pass,
         &[io::IoSlice::new(b"tap")],
-        &[ControlMessage::ScmRights(&fds)],
-        MsgFlags::empty(),
-        None,
+        &mut cmsg,
+        SendFlags::empty(),
     )
     .expect("send tap fd");
     tap_fd
@@ -137,10 +139,10 @@ pub fn spawn_sandbox_and_recv_tap(
     extra_env: &[(&str, String)],
 ) -> (std::process::Child, OwnedFd) {
     let (ours, theirs) = socketpair(
-        AddressFamily::Unix,
-        SockType::Datagram,
+        AddressFamily::UNIX,
+        SocketType::DGRAM,
+        SocketFlags::empty(),
         None,
-        SockFlag::empty(),
     )
     .expect("socketpair");
     let mut env = extra_env.to_vec();
@@ -149,20 +151,18 @@ pub fn spawn_sandbox_and_recv_tap(
         .spawn()
         .expect("spawn sandbox");
 
-    let mut cmsg = nix::cmsg_space!([RawFd; 1]);
+    let mut space = vec![MaybeUninit::uninit(); cmsg_space!(ScmRights(1))];
+    let mut cmsg = RecvAncillaryBuffer::new(&mut space);
     let mut data = [0u8; 8];
     let mut iov = [io::IoSliceMut::new(&mut data)];
-    let msg = recvmsg::<()>(
-        ours.as_raw_fd(),
-        &mut iov,
-        Some(&mut cmsg),
-        MsgFlags::empty(),
-    )
-    .expect("recv tap fd");
-    let tap_fd = match msg.cmsgs().expect("cmsgs").next() {
-        Some(ControlMessageOwned::ScmRights(fds)) => unsafe { OwnedFd::from_raw_fd(fds[0]) },
-        other => panic!("expected SCM_RIGHTS, got {other:?}"),
-    };
+    recvmsg(&ours, &mut iov, &mut cmsg, RecvFlags::empty()).expect("recv tap fd");
+    let tap_fd = cmsg
+        .drain()
+        .find_map(|m| match m {
+            RecvAncillaryMessage::ScmRights(mut fds) => fds.next(),
+            _ => None,
+        })
+        .expect("expected SCM_RIGHTS with the tap fd");
     (child, tap_fd)
 }
 
@@ -187,12 +187,12 @@ pub fn connect_with_retry(target: &str) -> io::Result<TcpStream> {
 pub fn ping(dst: &str) -> bool {
     let v4 = !dst.contains(':');
     let (family, proto) = if v4 {
-        (AddressFamily::Inet, SockProtocol::Icmp)
+        (AddressFamily::INET, ipproto::ICMP)
     } else {
-        (AddressFamily::Inet6, SockProtocol::IcmpV6)
+        (AddressFamily::INET6, ipproto::ICMPV6)
     };
-    let fd =
-        socket(family, SockType::Datagram, SockFlag::SOCK_CLOEXEC, proto).expect("ping socket");
+    let fd = socket_with(family, SocketType::DGRAM, SocketFlags::CLOEXEC, Some(proto))
+        .expect("ping socket");
     let sock = UdpSocket::from(fd);
     sock.connect((dst, 0)).expect("connect ping socket");
     sock.set_read_timeout(Some(Duration::from_millis(300)))

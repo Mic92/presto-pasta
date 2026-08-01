@@ -3,7 +3,9 @@
 //! The caller opens the device inside the sandbox netns with
 //! `IFF_TAP | IFF_NO_PI | IFF_VNET_HDR` and hands presto-pasta the fd.
 
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+
+use rustix::ioctl::{IntegerSetter, Opcode, ioctl, opcode};
 
 // TUN_F_* offload flags (linux/if_tun.h); not exposed by libc.
 pub const TUN_F_CSUM: libc::c_int = 0x01;
@@ -86,10 +88,7 @@ pub struct Tap {
     offloads: Offloads,
 }
 
-nix::ioctl_write_int_bad!(
-    tun_set_offload,
-    nix::request_code_write!(b'T', 208, std::mem::size_of::<libc::c_uint>())
-);
+const TUNSETOFFLOAD: Opcode = opcode::write::<libc::c_uint>(b'T', 208);
 
 impl Tap {
     /// Take ownership of the fd and negotiate offloads. Falls back to
@@ -106,7 +105,8 @@ impl Tap {
         for flags in attempts {
             // SAFETY: fd is a valid tun fd; TUNSETOFFLOAD takes the flag
             // word as the ioctl argument.
-            if unsafe { tun_set_offload(fd.as_raw_fd(), flags) }.is_ok() {
+            let arg = flags.unsigned_abs() as usize;
+            if unsafe { ioctl(&fd, IntegerSetter::<TUNSETOFFLOAD>::new_usize(arg)) }.is_ok() {
                 offloads = Offloads(flags);
                 break;
             }
