@@ -11,14 +11,14 @@ categories = ["network-programming", "virtualization"]
 
 [dependencies]
 libc = "0.2"
-nix = { version = "0.31", features = ["net", "socket", "uio", "fs", "ioctl"] }
+rustix = { version = "1.1", features = ["net"] }
 io-uring = "0.7"
 foldhash = "0.2"
 seccompiler = { version = "0.5", optional = true }
 
 [dev-dependencies]
-# Extra nix features used only by the tests (CPU pinning in the bench).
-nix = { version = "0.31", features = ["sched", "process"] }
+# The thread feature is used only by the tests (CPU pinning in the bench).
+rustix = { version = "1.1", features = ["net", "thread"] }
 
 [features]
 # Confine the datapath thread to a syscall allowlist while it runs.

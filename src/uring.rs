@@ -7,13 +7,15 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 use io_uring::{IoUring, opcode, register::Restriction, squeue, types};
-use nix::sys::socket::{
-    AddressFamily, MsgFlags, Shutdown, SockFlag, SockProtocol, SockType, SockaddrStorage, connect,
-    getsockopt, recv, recvmsg, send, setsockopt, shutdown, socket, sockopt,
+use rustix::io::{Errno, write, writev};
+use rustix::ioctl::{Getter, Opcode, ioctl};
+use rustix::net::{
+    AddressFamily, RecvAncillaryBuffer, RecvFlags, SendFlags, Shutdown, SocketFlags, SocketType,
+    connect, ipproto, recv, recvmsg, send, shutdown, socket_with, sockopt,
 };
 
 use crate::{Config, buf, dns, flow, proto, tap};
@@ -65,7 +67,10 @@ const POLL_HUP: u32 = libc::POLLHUP as u32;
 
 // SIOCOUTQ: bytes queued in a socket's send buffer (linux/sockios.h);
 // numerically TIOCOUTQ, which is what libc exposes.
-nix::ioctl_read_bad!(siocoutq, libc::TIOCOUTQ, libc::c_int);
+#[expect(clippy::cast_possible_truncation, reason = "ioctl opcodes fit in u32")]
+const SIOCOUTQ: Opcode = libc::TIOCOUTQ as Opcode;
+
+type Siocoutq = Getter<SIOCOUTQ, libc::c_int>;
 
 /// Operations the datapath needs; everything else is rejected by the
 /// kernel. Restrictions can only be registered while the ring is
@@ -496,9 +501,8 @@ impl EventLoop {
         };
         if let Some(f) = self.flows.get_mut(id) {
             f.last_active = Instant::now();
-            let raw = f.sock.as_raw_fd();
             let data = &self.pool.get(self.tap_buf)[payload];
-            let _ = send(raw, data, MsgFlags::MSG_DONTWAIT); // drop on EAGAIN/unreachable
+            let _ = send(&f.sock, data, SendFlags::DONTWAIT); // drop on EAGAIN/unreachable
         }
     }
 
@@ -618,7 +622,6 @@ impl EventLoop {
         let Some(f) = self.flows.get_by_id(id) else {
             return;
         };
-        let raw = f.sock.as_raw_fd();
         let buf_id = f.buf;
         // The IPv4 total-length field bounds a super-frame's payload;
         // it is tighter than IPv6's payload length (which excludes the
@@ -630,7 +633,10 @@ impl EventLoop {
             // The buffer keeps at least a full datagram of space beyond
             // `max`, so drained datagrams are never truncated.
             let room = &mut self.pool.get_mut(buf_id)[buf::HEADROOM + total..];
-            let Ok(n) = recv(raw, room, MsgFlags::MSG_DONTWAIT) else {
+            let Some(f) = self.flows.get_by_id(id) else {
+                break;
+            };
+            let Ok((n, _)) = recv(&f.sock, room, RecvFlags::DONTWAIT) else {
                 break;
             };
             self.stats.sock_recv(false);
@@ -785,7 +791,7 @@ impl EventLoop {
         b[vnet_start..eth_start].copy_from_slice(&vnet.to_bytes());
 
         self.stats.tap_out(end - vnet_start);
-        let _ = nix::unistd::write(self.tap.fd(), &b[vnet_start..end]);
+        let _ = write(self.tap.fd(), &b[vnet_start..end]);
     }
 
     /// Translate a host socket error on a UDP flow (delivered by ICMP
@@ -893,27 +899,27 @@ impl EventLoop {
         // target; guest-facing framing keeps using key.dst.
         let target = self.cfg.nat64_target(key.dst);
         let family = if target.is_ipv4() {
-            AddressFamily::Inet
+            AddressFamily::INET
         } else {
-            AddressFamily::Inet6
+            AddressFamily::INET6
         };
-        let sock = socket(
+        let sock = socket_with(
             family,
-            SockType::Stream,
-            SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
-            SockProtocol::Tcp,
+            SocketType::STREAM,
+            SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+            Some(ipproto::TCP),
         )
         .ok()?;
         // The window we advertise to the guest is the free space in the
         // send buffer; the kernel default (~200 KiB, and fixed once we
         // read it) caps upload throughput at window/loop-latency, so
         // ask for a larger buffer up front.
-        let _ = setsockopt(&sock, sockopt::SndBuf, &(4 * 1024 * 1024));
-        match connect(sock.as_raw_fd(), &SockaddrStorage::from(target)) {
-            Ok(()) | Err(nix::errno::Errno::EINPROGRESS) => {}
+        let _ = sockopt::set_socket_send_buffer_size(&sock, 4 * 1024 * 1024);
+        match connect(&sock, &target) {
+            Ok(()) | Err(Errno::INPROGRESS) => {}
             Err(_) => return None, // no SYN-ACK; the guest times out
         }
-        let sndbuf = getsockopt(&sock, sockopt::SndBuf)
+        let sndbuf = sockopt::socket_send_buffer_size(&sock)
             .ok()
             .and_then(|v| u32::try_from(v).ok())
             .unwrap_or(u32::from(u16::MAX));
@@ -981,7 +987,11 @@ impl EventLoop {
         };
         t.poll_armed = false;
         let state = t.state;
-        let sock_err = getsockopt(&f.sock, sockopt::SocketError).unwrap_or(libc::ECONNRESET);
+        let sock_err = match sockopt::socket_error(&f.sock) {
+            Ok(Ok(())) => 0,
+            Ok(Err(e)) => e.raw_os_error(),
+            Err(_) => libc::ECONNRESET,
+        };
         match state {
             flow::TcpState::Connecting => {
                 if events & (POLL_ERR | POLL_HUP) != 0 || sock_err != 0 {
@@ -1012,7 +1022,6 @@ impl EventLoop {
             return;
         };
         f.last_active = Instant::now();
-        let raw = f.sock.as_raw_fd();
         let Some(t) = f.tcp.as_mut() else {
             return;
         };
@@ -1046,8 +1055,10 @@ impl EventLoop {
         if !payload.is_empty() {
             if Some(hdr.seq) == expected_seq {
                 let data = &self.pool.get(self.tap_buf)[payload.clone()];
-                accepted =
-                    send(raw, data, MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL).unwrap_or(0);
+                if let Some(f) = self.flows.get_by_id(id) {
+                    accepted =
+                        send(&f.sock, data, SendFlags::DONTWAIT | SendFlags::NOSIGNAL).unwrap_or(0);
+                }
                 self.stats.sock_send(accepted, payload.len());
                 if let Some(t) = self.flows.get_mut(id).and_then(|f| f.tcp.as_mut()) {
                     #[expect(clippy::cast_possible_truncation, reason = "frame fits u32")]
@@ -1071,7 +1082,8 @@ impl EventLoop {
         }
         if hdr.flags & proto::TCP_FIN != 0
             && accepted == payload.len()
-            && let Some(t) = self.flows.get_mut(id).and_then(|f| f.tcp.as_mut())
+            && let Some(f) = self.flows.get_mut(id)
+            && let Some(t) = f.tcp.as_mut()
         {
             let fin_seq = hdr
                 .seq
@@ -1079,7 +1091,7 @@ impl EventLoop {
             if !t.guest_fin_received && fin_seq == t.seq_from_guest {
                 t.guest_fin_received = true;
                 t.seq_from_guest = t.seq_from_guest.wrapping_add(1);
-                let _ = shutdown(raw, Shutdown::Write);
+                let _ = shutdown(&f.sock, Shutdown::Write);
             }
             // Ack the FIN, and re-ack a retransmitted one so the guest
             // is not stuck retrying when our first ack was lost.
@@ -1160,7 +1172,6 @@ impl EventLoop {
         let Some(f) = self.flows.get_by_id(id) else {
             return;
         };
-        let raw = f.sock.as_raw_fd();
         let buf_id = f.buf;
         let Some(t) = f.tcp.as_ref() else {
             return;
@@ -1186,7 +1197,7 @@ impl EventLoop {
             self.stats.window_full();
             return; // window full; the next guest ack retriggers
         }
-        let Some(drained) = self.tcp_fill_buffer(id, raw, buf_id) else {
+        let Some(drained) = self.tcp_fill_buffer(id, buf_id) else {
             return; // flow was reset
         };
         let Some(t) = self.tcp_state(id) else {
@@ -1263,7 +1274,7 @@ impl EventLoop {
     /// socket; a read that hits the end of the ring wraps around via a
     /// second iovec. Returns whether the socket was drained; `None`
     /// when a read error reset the flow.
-    fn tcp_fill_buffer(&mut self, id: usize, raw: RawFd, buf_id: buf::BufId) -> Option<bool> {
+    fn tcp_fill_buffer(&mut self, id: usize, buf_id: buf::BufId) -> Option<bool> {
         let Some(t) = self.flows.get_mut(id).and_then(|f| f.tcp.as_mut()) else {
             return Some(false);
         };
@@ -1277,19 +1288,26 @@ impl EventLoop {
         let wpos = (head + buffered) % buf::FRAME;
         let first = free.min(buf::FRAME - wpos);
         let ring = &mut self.pool.get_mut(buf_id)[buf::HEADROOM..buf::HEADROOM + buf::FRAME];
+        let sock = &self.flows.get_by_id(id)?.sock;
         let res = if first == free {
-            recv(raw, &mut ring[wpos..wpos + first], MsgFlags::MSG_DONTWAIT)
+            recv(sock, &mut ring[wpos..wpos + first], RecvFlags::DONTWAIT).map(|(n, _)| n)
         } else {
             let (front, back) = ring.split_at_mut(wpos);
             let mut iov = [
                 io::IoSliceMut::new(&mut back[..first]),
                 io::IoSliceMut::new(&mut front[..free - first]),
             ];
-            recvmsg::<()>(raw, &mut iov, None, MsgFlags::MSG_DONTWAIT).map(|m| m.bytes)
+            recvmsg(
+                sock,
+                &mut iov,
+                &mut RecvAncillaryBuffer::default(),
+                RecvFlags::DONTWAIT,
+            )
+            .map(|m| m.bytes)
         };
         let mut drained = false;
         match res {
-            Err(nix::errno::Errno::EAGAIN) => {
+            Err(Errno::AGAIN) => {
                 self.stats.sock_recv(true);
                 drained = true;
             }
@@ -1323,11 +1341,10 @@ impl EventLoop {
         let Some(t) = f.tcp.as_ref() else {
             return 0;
         };
-        let mut queued: libc::c_int = 0;
         // SAFETY: SIOCOUTQ writes a c_int for any socket fd.
-        if unsafe { siocoutq(f.sock.as_raw_fd(), &raw mut queued) }.is_err() {
+        let Ok(queued) = (unsafe { ioctl(&f.sock, Siocoutq::new()) }) else {
             return 0;
-        }
+        };
         let free = t.sndbuf.saturating_sub(queued.max(0).unsigned_abs());
         let scaled = if t.guest_wscale.is_some() {
             free >> WINDOW_SHIFT
@@ -1487,7 +1504,7 @@ impl EventLoop {
         .write(&mut frame[eth_start..]);
         frame[..eth_start].copy_from_slice(&tap::VnetHdr::default().to_bytes());
         self.stats.tap_out(hdr_end);
-        let _ = nix::unistd::write(self.tap.fd(), &frame[..hdr_end]);
+        let _ = write(self.tap.fd(), &frame[..hdr_end]);
     }
 
     /// Abort the flow towards both sides.
@@ -1608,7 +1625,7 @@ impl EventLoop {
             io::IoSlice::new(payload),
             io::IoSlice::new(payload2),
         ];
-        let _ = nix::sys::uio::writev(self.tap.fd(), &iov);
+        let _ = writev(self.tap.fd(), &iov);
     }
 }
 
@@ -1635,9 +1652,15 @@ struct TcpSegment<'a> {
 /// Unprivileged ICMP echo ("ping") socket for the given address family.
 fn ping_socket(dst: IpAddr) -> Option<UdpSocket> {
     let (family, protocol) = match dst {
-        IpAddr::V4(_) => (AddressFamily::Inet, SockProtocol::Icmp),
-        IpAddr::V6(_) => (AddressFamily::Inet6, SockProtocol::IcmpV6),
+        IpAddr::V4(_) => (AddressFamily::INET, ipproto::ICMP),
+        IpAddr::V6(_) => (AddressFamily::INET6, ipproto::ICMPV6),
     };
-    let fd = socket(family, SockType::Datagram, SockFlag::SOCK_CLOEXEC, protocol).ok()?;
+    let fd = socket_with(
+        family,
+        SocketType::DGRAM,
+        SocketFlags::CLOEXEC,
+        Some(protocol),
+    )
+    .ok()?;
     Some(UdpSocket::from(fd))
 }

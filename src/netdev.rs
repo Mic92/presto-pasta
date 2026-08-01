@@ -11,7 +11,10 @@ use std::io;
 use std::net::IpAddr;
 use std::os::fd::{AsRawFd, OwnedFd};
 
-use nix::sys::socket::{AddressFamily, SockFlag, SockProtocol, SockType, socket};
+use rustix::net::{
+    AddressFamily, RecvFlags, SendFlags, SocketFlags, SocketType, netdevice, recv, send,
+    socket_with,
+};
 
 use crate::Config;
 
@@ -133,13 +136,9 @@ fn family(ip: IpAddr) -> u8 {
 
 /// Send one rtnetlink request and wait for its acknowledgement.
 fn rtnetlink(sock: &OwnedFd, req: &[u8]) -> io::Result<()> {
-    nix::sys::socket::send(sock.as_raw_fd(), req, nix::sys::socket::MsgFlags::empty())?;
+    send(sock, req, SendFlags::empty())?;
     let mut buf = [0u8; 512];
-    let n = nix::sys::socket::recv(
-        sock.as_raw_fd(),
-        &mut buf,
-        nix::sys::socket::MsgFlags::empty(),
-    )?;
+    let (n, _) = recv(sock, &mut buf[..], RecvFlags::empty())?;
     let hdr_len = std::mem::size_of::<libc::nlmsghdr>();
     if n < hdr_len + 4 {
         return Err(io::Error::other("short netlink reply"));
@@ -163,10 +162,10 @@ fn rtnetlink(sock: &OwnedFd, req: &[u8]) -> io::Result<()> {
 
 /// Set `IFF_UP` and the MTU via `SIOCSIFFLAGS`/`SIOCSIFMTU`.
 fn link_up(ifname: &str) -> io::Result<()> {
-    let sock = socket(
-        AddressFamily::Inet,
-        SockType::Datagram,
-        SockFlag::SOCK_CLOEXEC,
+    let sock = socket_with(
+        AddressFamily::INET,
+        SocketType::DGRAM,
+        SocketFlags::CLOEXEC,
         None,
     )?;
     let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
@@ -271,13 +270,20 @@ fn add_neighbor(sock: &OwnedFd, ifindex: u32, gateway: IpAddr, mac: [u8; 6]) -> 
 /// exist or the caller lacks `CAP_NET_ADMIN`.
 pub fn configure(ifname: &str, cfg: &Config) -> io::Result<()> {
     link_up(ifname)?;
-    let ifindex = nix::net::if_::if_nametoindex(ifname)?;
+    let inet = socket_with(
+        AddressFamily::INET,
+        SocketType::DGRAM,
+        SocketFlags::CLOEXEC,
+        None,
+    )?;
+    let ifindex = netdevice::name_to_index(&inet, ifname)?;
 
-    let sock = socket(
-        AddressFamily::Netlink,
-        SockType::Raw,
-        SockFlag::SOCK_CLOEXEC,
-        SockProtocol::NetlinkRoute,
+    // NETLINK_ROUTE is rustix's default netlink protocol.
+    let sock = socket_with(
+        AddressFamily::NETLINK,
+        SocketType::RAW,
+        SocketFlags::CLOEXEC,
+        None,
     )?;
     for (guest, gateway) in [
         (IpAddr::V4(cfg.guest4), IpAddr::V4(cfg.gateway4)),
