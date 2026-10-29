@@ -114,8 +114,10 @@ pub struct Config {
     /// Called once per new guest flow with its destination; a `false`
     /// return refuses the flow (the guest sees an unreachable host).
     /// `None` applies the default policy: refuse loopback destinations,
-    /// allow everything else. DNS to the gateway address is forwarded
-    /// by presto-pasta itself and bypasses this filter.
+    /// allow everything else. Unspecified destinations (`0.0.0.0`, `::`),
+    /// which a host connect turns into loopback, are refused before the
+    /// filter is asked. DNS to the gateway address is forwarded by
+    /// presto-pasta itself and bypasses this filter.
     pub allow_flow: Option<FlowFilter>,
     /// NAT64 /96 prefix for IPv6-only hosts (CLAT-style). When set,
     /// IPv4 destinations from the guest are embedded into this prefix

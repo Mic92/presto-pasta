@@ -589,6 +589,12 @@ impl EventLoop {
     /// Apply the caller's flow policy (or the default: refuse loopback
     /// destinations) to a new flow.
     fn flow_allowed(&self, key: &flow::FlowKey) -> bool {
+        // Refuse an unspecified destination before any policy, as pasta
+        // does: a host connect() to it reaches loopback, and no guest
+        // kernel sends to it.
+        if key.dst.ip().to_canonical().is_unspecified() {
+            return false;
+        }
         let dst = crate::FlowDst {
             proto: key.proto,
             ip: key.dst.ip(),
