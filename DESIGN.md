@@ -44,6 +44,8 @@ a built-in seccomp filter is an optional feature.
 ## Scope
 
 - outbound TCP and UDP, per-flow connected host sockets
+- a guest SYN whose host connect fails at once is reset, as pasta
+  does; one to a multicast or broadcast address is dropped
 - ICMP/ICMPv6 echo via ping sockets; if `net.ipv4.ping_group_range`
   excludes the caller's gid, echo is disabled instead of failing
 - DNS forwarding: queries to the gateway address go to the host

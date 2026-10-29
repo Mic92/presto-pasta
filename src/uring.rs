@@ -892,6 +892,12 @@ impl EventLoop {
     /// its outcome; the SYN-ACK is only sent once the host connection
     /// is established, so connection refusal maps to RST.
     fn new_tcp_flow(&mut self, key: flow::FlowKey, syn: &proto::TcpHdr) -> Option<usize> {
+        // RFC 1122 4.2.3.10: silently discard a SYN to a multicast or
+        // broadcast address, as pasta's tcp_conn_from_tap does.
+        let dst = key.dst.ip().to_canonical();
+        if dst.is_multicast() || dst == IpAddr::V4(std::net::Ipv4Addr::BROADCAST) {
+            return None;
+        }
         if !self.flow_allowed(&key) {
             return None; // no SYN-ACK; the guest times out
         }
@@ -917,7 +923,13 @@ impl EventLoop {
         let _ = sockopt::set_socket_send_buffer_size(&sock, 4 * 1024 * 1024);
         match connect(&sock, &target) {
             Ok(()) | Err(Errno::INPROGRESS) => {}
-            Err(_) => return None, // no SYN-ACK; the guest times out
+            // Reset a failed connect (no route, say), as pasta does,
+            // instead of leaving the guest to retransmit its SYN for
+            // minutes.
+            Err(_) => {
+                self.send_tcp_rst_no_flow(key.dst.ip(), syn, 0);
+                return None;
+            }
         }
         let sndbuf = sockopt::socket_send_buffer_size(&sock)
             .ok()
