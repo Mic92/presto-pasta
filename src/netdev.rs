@@ -8,7 +8,7 @@
 //! callers do not need an `ip` binary in the sandbox.
 
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd};
 
 use rustix::net::{
@@ -258,11 +258,34 @@ fn add_neighbor(sock: &OwnedFd, ifindex: u32, gateway: IpAddr, mac: [u8; 6]) -> 
     rtnetlink(sock, &req)
 }
 
+/// Whether the host's sockets can reach IPv6 destinations: the kernel
+/// has a route to a global one and a source address for it that is
+/// neither loopback nor link-local, as a connected UDP socket (which
+/// sends nothing) shows. Intended for [`Config::ipv6`], called in the
+/// namespace the datapath's host sockets live in.
+#[must_use]
+pub fn host_has_ipv6_default_route() -> bool {
+    // A global unicast address (a public resolver's), so that neither a
+    // documentation prefix on a link nor a route blocking one decides.
+    let probe = SocketAddr::new(
+        Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888).into(),
+        53,
+    );
+    UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0))
+        .and_then(|s| s.connect(probe).and_then(|()| s.local_addr()))
+        .is_ok_and(|a| match a {
+            // With no other candidate the kernel picks ::1.
+            SocketAddr::V6(a) => !(a.ip().is_loopback() || a.ip().is_unicast_link_local()),
+            SocketAddr::V4(_) => false,
+        })
+}
+
 /// Configure the tap interface inside the sandbox namespace to match
 /// `cfg`: link up with a large MTU, the guest addresses (host-width
 /// prefixes), onlink default routes via the gateway addresses and
-/// permanent neighbor entries for the gateway MAC. Must run in the
-/// namespace that owns the interface, with `CAP_NET_ADMIN` there.
+/// permanent neighbor entries for the gateway MAC; IPv6 only with
+/// [`Config::ipv6`]. Must run in the namespace that owns the interface,
+/// with `CAP_NET_ADMIN` there.
 ///
 /// # Errors
 ///
@@ -289,6 +312,9 @@ pub fn configure(ifname: &str, cfg: &Config) -> io::Result<()> {
         (IpAddr::V4(cfg.guest4), IpAddr::V4(cfg.gateway4)),
         (IpAddr::V6(cfg.guest6), IpAddr::V6(cfg.gateway6)),
     ] {
+        if guest.is_ipv6() && !cfg.ipv6 {
+            continue;
+        }
         add_addr(&sock, ifindex, guest)?;
         add_neighbor(&sock, ifindex, gateway, cfg.gateway_mac)?;
         add_default_route(&sock, ifindex, gateway)?;

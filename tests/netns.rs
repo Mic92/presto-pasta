@@ -646,6 +646,53 @@ fn udp_unreachable() {
     run_in_userns("unreachable-host", "udp_unreachable", &[]);
 }
 
+/// The IPv6 probe follows the namespace's routes and addresses, and
+/// `configure` gives the interface IPv6 only with `Config::ipv6`.
+fn ipv6_probe_ns() -> ! {
+    use presto_pasta::netdev::{configure, host_has_ipv6_default_route as has_ipv6};
+    ip("link set lo up");
+    // A bridge without ports has no carrier: an address added without
+    // nodad stays tentative.
+    ip("link add d0 type bridge");
+    ip("link set d0 addrgenmode none");
+    ip("link set d0 up");
+    ip("-6 route add default dev d0");
+    assert!(!has_ipv6(), "a route, but only a loopback source");
+    ip("-6 addr add 2001:db8:1::1/64 dev d0");
+    assert!(!has_ipv6(), "a route, but only a tentative global address");
+    ip("-6 addr add fe80::1/64 dev d0 nodad");
+    assert!(!has_ipv6(), "a route, but only a link-local source");
+    ip("-6 addr add 2001:db8:2::1/64 dev d0 nodad");
+    assert!(has_ipv6(), "a route and a global source");
+    ip("link del d0");
+    assert!(!has_ipv6(), "no route");
+    ip("link add d1 type dummy");
+    ip("link set d1 up");
+    ip("-6 addr add 2001:db8::5/64 dev d1 nodad");
+    assert!(!has_ipv6(), "no route but an on-link prefix's");
+
+    ip("link add t0 type dummy");
+    let cfg = presto_pasta::Config {
+        ipv6: false,
+        ..presto_pasta::Config::default()
+    };
+    configure("t0", &cfg).expect("configure without IPv6");
+    assert!(!has_ipv6(), "IPv6 without Config::ipv6");
+    let v4 = UdpSocket::bind("0.0.0.0:0").and_then(|s| s.connect("192.0.2.1:53"));
+    assert!(v4.is_ok(), "no IPv4 route: {v4:?}");
+    configure("t0", &presto_pasta::Config::default()).expect("configure with IPv6");
+    assert!(has_ipv6(), "no IPv6 with Config::ipv6");
+    exit(0);
+}
+
+#[test]
+fn ipv6_probe() {
+    if std::env::var(ROLE).as_deref() == Ok("ipv6-probe") {
+        ipv6_probe_ns();
+    }
+    run_in_userns("ipv6-probe", "ipv6_probe", &[]);
+}
+
 /// Host namespace for the NAT64 test: services listen only on an IPv6
 /// address that embeds 10.0.0.1 into the `fd00:64::/96` prefix; there is
 /// no IPv4 service at all, mirroring an IPv6-only host.

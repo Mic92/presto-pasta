@@ -65,6 +65,6 @@ pcap.
 
 See the usage snippet in the [README](README.md). `Config`:
 gateway/guest addresses (to synthesize headers and recognize DNS
-traffic), DNS forwarding, NAT64 prefix, buffer pool size. Defaults use
-link-local v4 and a fixed ULA-style v6 scheme suitable for build
-sandboxes.
+traffic), DNS forwarding, NAT64 prefix, buffer pool size, and whether
+the guest gets IPv6 at all. Defaults use link-local v4 and a fixed
+ULA-style v6 scheme suitable for build sandboxes.
