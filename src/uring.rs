@@ -447,10 +447,16 @@ impl EventLoop {
         let payload =
             g.l4.start + proto::UDP_HDR_LEN..(g.l4.start + usize::from(udp.len)).min(g.l4.end);
         if let Some(seg) = g.udp_gso.map(usize::from) {
+            // A segment that gets no flow (refused, its host connect
+            // failed and was answered, or no buffer) ends the frame: the
+            // others would fail the same way, and the guest sent one
+            // packet, so it gets one answer.
             let mut off = payload.start;
             while off < payload.end {
                 let end = (off + seg).min(payload.end);
-                self.forward(key, flow::FlowKind::Udp, off..end);
+                if !self.forward(key, flow::FlowKind::Udp, off..end) {
+                    break;
+                }
                 off = end;
             }
         } else {
@@ -490,20 +496,22 @@ impl EventLoop {
 
     /// Look up or create the flow for `key` and send the guest bytes
     /// at `payload` (a range within the tap buffer) to its socket.
+    /// Whether there is a flow for them.
     fn forward(
         &mut self,
         key: flow::FlowKey,
         kind: flow::FlowKind,
         payload: std::ops::Range<usize>,
-    ) {
+    ) -> bool {
         let Some(id) = self.flows.get(&key).or_else(|| self.new_flow(key, kind)) else {
-            return;
+            return false;
         };
         if let Some(f) = self.flows.get_mut(id) {
             f.last_active = Instant::now();
             let data = &self.pool.get(self.tap_buf)[payload];
             let _ = send(&f.sock, data, SendFlags::DONTWAIT); // drop on EAGAIN/unreachable
         }
+        true
     }
 
     /// Create the connected host socket for a new guest flow and arm
@@ -535,9 +543,26 @@ impl EventLoop {
                 } else {
                     std::net::Ipv6Addr::UNSPECIFIED.into()
                 };
-                let sock = UdpSocket::bind(SocketAddr::new(bind_ip, 0)).ok()?;
-                sock.connect(target).ok()?;
-                sock
+                let sock = UdpSocket::bind(SocketAddr::new(bind_ip, 0))
+                    .and_then(|sock| sock.connect(target).map(|()| sock));
+                match sock {
+                    Ok(sock) => sock,
+                    Err(e) => {
+                        // Bound first, so a shortage of ports shows at
+                        // bind (EADDRINUSE); EADDRNOTAVAIL is the
+                        // connect's, from a host without a source address
+                        // for the destination: no route to it, as for
+                        // EAFNOSUPPORT.
+                        let errno = e.raw_os_error().map(|errno| match errno {
+                            libc::EADDRNOTAVAIL => libc::ENETUNREACH,
+                            errno => errno,
+                        });
+                        if let Some(codes) = errno.and_then(unreachable_codes) {
+                            self.unreachable_to_guest(key, codes, Quote::Udp);
+                        }
+                        return None;
+                    }
+                }
             }
             flow::FlowKind::Ping => {
                 // Requires net.ipv4.ping_group_range to cover our gid;
@@ -779,12 +804,8 @@ impl EventLoop {
     /// unreachable towards the guest, so guest sockets see e.g.
     /// ECONNREFUSED for closed ports just like on a kernel path.
     fn udp_error_to_guest(&mut self, id: usize, errno: i32) {
-        // v4 / v6 code per RFC 792 and RFC 4443.
-        let codes = match errno {
-            libc::ECONNREFUSED => (3, 4), // port unreachable
-            libc::EHOSTUNREACH => (1, 3), // host / address unreachable
-            libc::ENETUNREACH => (0, 0),  // net unreachable / no route
-            _ => return,
+        let Some(codes) = unreachable_codes(errno) else {
+            return;
         };
         let Some(f) = self.flows.get_mut(id) else {
             return;
@@ -1702,10 +1723,12 @@ fn unreachable_codes(errno: i32) -> Option<(u8, u8)> {
         // net unreachable / no route; a host without the address
         // family has no route to it either
         libc::ENETUNREACH | libc::EAFNOSUPPORT => Some((0, 0)),
-        // A firewall or LSM refused it: communication administratively
-        // prohibited (RFC 1812 5.2.7.1, RFC 4443 3.1). IPv6 guests see
-        // EACCES; no ICMPv4 code gives EACCES on Linux, so IPv4 guests
-        // see EHOSTUNREACH.
+        // A firewall or LSM refused it, or (UDP) the destination is a
+        // subnet broadcast address of one of the host's networks, which
+        // needs SO_BROADCAST (__ip4_datagram_connect): communication
+        // administratively prohibited (RFC 1812 5.2.7.1, RFC 4443 3.1).
+        // IPv6 guests see EACCES; no ICMPv4 code gives EACCES on Linux,
+        // so IPv4 guests see EHOSTUNREACH.
         libc::EACCES | libc::EPERM => Some((13, 1)),
         _ => None,
     }

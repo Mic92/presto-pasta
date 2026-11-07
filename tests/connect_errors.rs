@@ -1,6 +1,6 @@
-//! A guest TCP connection the host cannot make is answered at once
-//! instead of dropped: ICMP/ICMPv6 destination unreachable for routing
-//! errors and prohibit routes, RST for a refused connect and for an
+//! A guest connection the host cannot make is answered at once instead
+//! of dropped: ICMP/ICMPv6 destination unreachable for routing errors
+//! and prohibit routes, RST for a refused TCP connect and for a TCP
 //! error no ICMP code gives. Otherwise the guest keeps retransmitting
 //! its SYN for minutes before its connect gives up. A SYN or datagram
 //! to a multicast or broadcast address, IPv4-mapped ones included,
@@ -127,7 +127,13 @@ impl Datapath {
 
     /// Send one guest IP packet, behind vnet and ethernet headers.
     fn send(&self, ip_packet: &[u8]) {
+        self.send_with(tap::VnetHdr::default(), ip_packet);
+    }
+
+    /// Send one guest IP packet behind `vnet` (e.g. a GSO header).
+    fn send_with(&self, vnet: tap::VnetHdr, ip_packet: &[u8]) {
         let mut frame = vec![0u8; tap::VNET_HDR_LEN + proto::ETH_LEN];
+        frame[..tap::VNET_HDR_LEN].copy_from_slice(&vnet.to_bytes());
         proto::EthHdr {
             dst: self.cfg.gateway_mac,
             src: GUEST_MAC,
@@ -496,6 +502,45 @@ fn check_tcp(dp: &Datapath, dst: SocketAddr, sport: u16, intended: Native) {
     eprintln!("checked {what}");
 }
 
+/// Send a guest datagram to `dst` and check the answer against a native
+/// UDP connect, which must fail at once with `errno`. The check is on
+/// the ICMP code's errno: of the codes sent here, only port unreachable
+/// and administratively prohibited fail a guest's connected UDP socket
+/// at once, while net and host unreachable reach it only with
+/// `IP_RECVERR`/`IPV6_RECVERR`.
+fn check_udp(dp: &Datapath, dst: SocketAddr, sport: u16, errno: i32) {
+    let native = native_connect(SocketType::DGRAM, dst);
+    assert_eq!(native, Native::Fails(errno), "{dst}: native UDP connect");
+    let what = format!("UDP datagram to {dst} (native {native:?})");
+    let datagram = udp_datagram(dp.guest_ip(dst.ip()), dst, sport);
+    let answer = dp.exchange(&datagram, &what);
+    assert_answer(&answer, &datagram, errno, &what);
+    eprintln!("checked {what}");
+}
+
+/// Send a UDP GSO frame of four one-byte segments to `dst`, which the
+/// datapath answers with an ICMP unreachable that gives the guest
+/// `errno`: the frame is one guest packet and gets that one answer, so
+/// a witness SYN sent after it gets the next.
+fn check_one_answer_per_gso_frame(dp: &Datapath, dst: SocketAddr, sport: u16, errno: i32) {
+    let what = format!("UDP GSO frame of 4 segments to {dst}");
+    let datagram = udp_datagram(dp.guest_ip(dst.ip()), dst, sport);
+    let gso = tap::VnetHdr {
+        gso_type: tap::VIRTIO_NET_HDR_GSO_UDP_L4,
+        gso_size: 1,
+        ..tap::VnetHdr::default()
+    };
+    dp.send_with(gso, &datagram);
+    let answer = dp.recv(&datagram, &what);
+    assert_answer(&answer, &datagram, errno, &what);
+    let to = SocketAddr::new(UNROUTED_V4.into(), 443);
+    let witness = tcp_syn(dp.guest_ip(to.ip()), to, sport + 1);
+    let what = format!("{what}: one answer, so the witness gets the next");
+    let answer = dp.exchange(&witness, &what);
+    assert_answer(&answer, &witness, libc::ENETUNREACH, &what);
+    eprintln!("checked {what}");
+}
+
 #[test]
 fn failed_tcp_connect_is_answered() {
     in_own_netns("failed_tcp_connect_is_answered", NETNS_SETUP, || {
@@ -555,6 +600,64 @@ fn tcp_connect_failing_later_is_answered() {
             40201,
             unreachable,
         );
+    });
+}
+
+#[test]
+fn failed_udp_connect_is_answered() {
+    in_own_netns("failed_udp_connect_is_answered", NETNS_SETUP, || {
+        let dp = Datapath::start();
+        let at = |ip: IpAddr| SocketAddr::new(ip, 53);
+        for (i, (dst, errno)) in [
+            (at(UNROUTED_V4.into()), libc::ENETUNREACH),
+            (at(UNROUTED_V6.into()), libc::ENETUNREACH),
+            (at(UNREACHABLE_V4.into()), libc::EHOSTUNREACH),
+            (at(UNREACHABLE_V6.into()), libc::EHOSTUNREACH),
+            (at(PROHIBITED_V4.into()), libc::EACCES),
+            (at(PROHIBITED_V6.into()), libc::EACCES),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let sport = 40300 + u16::try_from(i).expect("port");
+            check_udp(&dp, dst, sport, errno);
+        }
+    });
+}
+
+/// A host with IPv6 disabled has no IPv6 source address: an IPv6 UDP
+/// connect fails with EADDRNOTAVAIL, which presto-pasta's socket, bound
+/// first, can meet only for that reason. It is answered as no route.
+#[test]
+fn udp_connect_from_a_host_without_ipv6_is_answered() {
+    in_own_netns(
+        "udp_connect_from_a_host_without_ipv6_is_answered",
+        NETNS_SETUP,
+        || {
+            disable_ipv6();
+            let dp = Datapath::start();
+            let dst = SocketAddr::new(UNROUTED_V6.into(), 53);
+            let native = native_connect(SocketType::DGRAM, dst);
+            assert_eq!(
+                native,
+                Native::Fails(libc::EADDRNOTAVAIL),
+                "{dst}: native UDP connect"
+            );
+            let what = format!("UDP datagram to {dst} (native {native:?})");
+            let datagram = udp_datagram(dp.guest_ip(dst.ip()), dst, 40360);
+            let answer = dp.exchange(&datagram, &what);
+            assert_answer(&answer, &datagram, libc::ENETUNREACH, &what);
+            eprintln!("checked {what}");
+        },
+    );
+}
+
+#[test]
+fn one_answer_per_udp_gso_frame() {
+    in_own_netns("one_answer_per_udp_gso_frame", NETNS_SETUP, || {
+        let dp = Datapath::start();
+        let dst = SocketAddr::new(PROHIBITED_V4.into(), 53);
+        check_one_answer_per_gso_frame(&dp, dst, 40350, libc::EACCES);
     });
 }
 
