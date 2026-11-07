@@ -49,11 +49,13 @@ a built-in seccomp filter is an optional feature.
   refusals, else an RST for TCP; a TCP shortage that passes (fds,
   memory, buffers) gets no answer, so the guest retries. A UDP connect's
   `EADDRNOTAVAIL` (no source address) is answered as no route. Guest UDP
-  sockets see net or host unreachable only with `IP_RECVERR`. A packet
-  to a multicast or broadcast address gets no such answer (RFC 1122
-  3.2.2, 4.2.3.10), and a UDP GSO frame gets one however many segments
-  it carries. The answers need no pool buffer and are not rate-limited:
-  each answers one guest packet
+  sockets see net or host unreachable only with `IP_RECVERR`. A TCP or
+  UDP flow the caller's policy (`Config::allow_flow`) refuses is
+  answered as one a firewall refused: administratively prohibited. A
+  packet to a multicast or broadcast address gets no such answer (RFC
+  1122 3.2.2, 4.2.3.10), and a UDP GSO frame gets one however many
+  segments it carries. The answers need no pool buffer and are not
+  rate-limited: each answers one guest packet
 - ICMP/ICMPv6 echo via ping sockets; if `net.ipv4.ping_group_range`
   excludes the caller's gid, echo is disabled instead of failing
 - DNS forwarding: queries to the gateway address go to the host

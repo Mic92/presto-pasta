@@ -528,6 +528,14 @@ impl EventLoop {
             && (key.dst.ip() == IpAddr::V4(self.cfg.gateway4)
                 || key.dst.ip() == IpAddr::V6(self.cfg.gateway6));
         if !dns_redirect && !self.flow_allowed(&key) {
+            // Answered as a host connect a firewall refused (EACCES)
+            // is: administratively prohibited, which fails a connected
+            // UDP socket at once. An echo request gets no answer.
+            if kind == flow::FlowKind::Udp
+                && let Some(codes) = unreachable_codes(libc::EACCES)
+            {
+                self.unreachable_to_guest(key, codes, Quote::Udp);
+            }
             return None;
         }
         let sock = match kind {
@@ -935,7 +943,12 @@ impl EventLoop {
             return None;
         }
         if !self.flow_allowed(&key) {
-            return None; // no SYN-ACK; the guest times out
+            // Answered as a host connect a firewall refused (EACCES)
+            // is, so the guest's connect fails at once instead of after
+            // its SYN retries, and a client with another address for
+            // the name tries that one.
+            self.tcp_refuse_syn(key, syn, libc::EACCES);
+            return None;
         }
         // The host socket connects to the (possibly NAT64-mapped)
         // target; guest-facing framing keeps using key.dst.

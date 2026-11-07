@@ -1,8 +1,9 @@
-//! A guest connection the host cannot make is answered at once instead
-//! of dropped: ICMP/ICMPv6 destination unreachable for routing errors
-//! and prohibit routes, RST for a refused TCP connect and for a TCP
-//! error no ICMP code gives. Otherwise the guest keeps retransmitting
-//! its SYN for minutes before its connect gives up. A SYN or datagram
+//! A guest connection the host cannot make, or the flow policy refuses,
+//! is answered at once instead of dropped: ICMP/ICMPv6 destination
+//! unreachable for routing errors, prohibit routes and the policy, RST
+//! for a refused TCP connect and for a TCP error no ICMP code gives.
+//! Otherwise the guest keeps retransmitting its SYN for minutes before
+//! its connect gives up. A SYN or datagram
 //! to a multicast or broadcast address, IPv4-mapped ones included,
 //! gets no answer (RFC 1122 3.2.2, 4.2.3.10).
 //!
@@ -648,6 +649,47 @@ fn udp_connect_from_a_host_without_ipv6_is_answered() {
             let answer = dp.exchange(&datagram, &what);
             assert_answer(&answer, &datagram, libc::ENETUNREACH, &what);
             eprintln!("checked {what}");
+        },
+    );
+}
+
+/// A flow the policy refuses is answered as a host connect a firewall
+/// refused (EACCES) is: administratively prohibited, which [`owed`]
+/// turns into EHOSTUNREACH over IPv4. No host socket is made for it.
+#[test]
+fn flow_the_policy_refuses_is_answered_prohibited() {
+    in_own_netns(
+        "flow_the_policy_refuses_is_answered_prohibited",
+        NETNS_SETUP,
+        || {
+            let dp = Datapath::with_policy(Arc::new(|_: &FlowDst| false));
+            for (i, ip) in [IpAddr::from(UNROUTED_V4), UNROUTED_V6.into()]
+                .into_iter()
+                .enumerate()
+            {
+                let sport = 40700 + 2 * u16::try_from(i).expect("port");
+                for (what, dst, packet) in [
+                    {
+                        let dst = SocketAddr::new(ip, 443);
+                        ("TCP SYN", dst, tcp_syn(dp.guest_ip(ip), dst, sport))
+                    },
+                    {
+                        let dst = SocketAddr::new(ip, 53);
+                        let datagram = udp_datagram(dp.guest_ip(ip), dst, sport + 1);
+                        ("UDP datagram", dst, datagram)
+                    },
+                ] {
+                    let what = format!("refused {what} to {dst}");
+                    let answer = dp.exchange(&packet, &what);
+                    assert_answer(&answer, &packet, libc::EACCES, &what);
+                    eprintln!("checked {what}");
+                }
+            }
+            // A refused GSO frame gets one answer too; the witness SYN
+            // it is checked with must pass the policy.
+            let dp = Datapath::with_policy(Arc::new(|d: &FlowDst| d.proto != proto::IPPROTO_UDP));
+            let dst = SocketAddr::new(UNROUTED_V4.into(), 53);
+            check_one_answer_per_gso_frame(&dp, dst, 40710, libc::EACCES);
         },
     );
 }

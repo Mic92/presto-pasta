@@ -727,7 +727,8 @@ fn nat64() {
 }
 
 /// Host namespace for the flow filter test: echo services on 10.0.0.1,
-/// presto-pasta configured with a policy that refuses TCP to port 7878.
+/// presto-pasta configured with a policy that refuses TCP to port 7878
+/// and UDP to port 7779.
 fn filter_host() -> ! {
     ip("link set lo up");
     ip("addr add 10.0.0.1/32 dev lo");
@@ -743,7 +744,8 @@ fn filter_host() -> ! {
 
     let cfg = presto_pasta::Config {
         allow_flow: Some(std::sync::Arc::new(|dst: &presto_pasta::FlowDst| {
-            !(dst.proto == presto_pasta::proto::IPPROTO_TCP && dst.port == 7878)
+            !(dst.proto == presto_pasta::proto::IPPROTO_TCP && dst.port == 7878
+                || dst.proto == presto_pasta::proto::IPPROTO_UDP && dst.port == 7779)
         })),
         ..presto_pasta::Config::default()
     };
@@ -752,8 +754,9 @@ fn filter_host() -> ! {
     exit(i32::from(!status.success()));
 }
 
-/// Sandbox namespace: UDP passes the filter, the refused TCP flow never
-/// gets a SYN-ACK so the connect times out.
+/// Sandbox namespace: UDP passes the filter; the refused TCP and UDP
+/// flows are answered as administratively prohibited, which an IPv4
+/// socket sees as EHOSTUNREACH at once, not after its timeouts.
 fn filter_sandbox() -> ! {
     let _tap_fd = setup_and_pass_tap();
 
@@ -773,11 +776,27 @@ fn filter_sandbox() -> ! {
     }
     assert!(ok, "allowed UDP flow got no echo reply");
 
-    let refused = TcpStream::connect_timeout(
-        &"10.0.0.1:7878".parse().unwrap(),
-        Duration::from_millis(500),
+    let refused =
+        TcpStream::connect_timeout(&"10.0.0.1:7878".parse().unwrap(), Duration::from_secs(5))
+            .expect_err("filtered TCP flow unexpectedly connected");
+    assert_eq!(
+        refused.raw_os_error(),
+        Some(libc::EHOSTUNREACH),
+        "{refused}"
     );
-    assert!(refused.is_err(), "filtered TCP flow unexpectedly connected");
+
+    let udp = UdpSocket::bind("0.0.0.0:0").expect("bind in sandbox");
+    udp.connect("10.0.0.1:7779").expect("connect");
+    udp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    udp.send(b"hello").expect("send");
+    let refused = udp
+        .recv(&mut reply)
+        .expect_err("filtered UDP flow unexpectedly answered");
+    assert_eq!(
+        refused.raw_os_error(),
+        Some(libc::EHOSTUNREACH),
+        "{refused}"
+    );
     exit(0);
 }
 
