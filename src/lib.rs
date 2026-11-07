@@ -112,7 +112,11 @@ pub struct Config {
     /// idle UDP/ping flow is evicted. The default of 96 uses ~24 MiB.
     pub buffers: usize,
     /// Called once per new guest flow with its destination; a `false`
-    /// return refuses the flow (the guest sees an unreachable host).
+    /// return refuses the flow. A refused TCP or UDP flow is answered
+    /// with ICMP/ICMPv6 destination unreachable, administratively
+    /// prohibited, which fails a Linux guest's connect or connected UDP
+    /// socket at once (EHOSTUNREACH over IPv4, EACCES over IPv6); a
+    /// refused echo request gets no answer.
     /// `None` applies the default policy: refuse loopback destinations,
     /// allow everything else. DNS to the gateway address is forwarded
     /// by presto-pasta itself and bypasses this filter.
